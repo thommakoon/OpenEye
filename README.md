@@ -6,7 +6,6 @@
 *ETRA '26: Symposium on Eye Tracking Research and Applications*
 
 [![DOI](https://img.shields.io/badge/DOI-10.1145%2F3806031-blue)](https://doi.org/10.1145/3806031)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
 
