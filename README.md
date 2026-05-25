@@ -1,5 +1,3 @@
-# OpenEye
-
 # OpenEye: Cross-Device Eye Tracking for Head-Mounted Displays
 
 **Gangtae Park, Mingyu Han, and Ian Oakley**  
