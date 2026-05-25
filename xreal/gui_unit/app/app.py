@@ -406,7 +406,7 @@ class MainWindow(QMainWindow):
         if not self.device or not self.gaze_thread:
             QMessageBox.information(self, "Info", "Connect Noen")
             return
-        if not (self.tcp_thread and self.tcp_thread.conn):
+        if not (self.ipc_thread and self.ipc_thread.conn):
             QMessageBox.information(self, "Info", "Start TCP server")
             return
     
@@ -414,7 +414,7 @@ class MainWindow(QMainWindow):
             self.load_models()
             self.start_evaluation_logging()
             plan_path = self.build_and_save_random_saccade_plan()
-            self.plan_streamer = EvalPlanStreamer(self.tcp_thread, plan_path, tick_hz=EVAL_RATE_HZ)
+            self.plan_streamer = EvalPlanStreamer(self.ipc_thread, plan_path, tick_hz=EVAL_RATE_HZ)
             self.plan_streamer.start()
             self.eval_active = True
             self.btn_eval.setText("Stop")
@@ -441,7 +441,7 @@ class MainWindow(QMainWindow):
         if not self.device or not self.gaze_thread:
             QMessageBox.information(self, "Info", "Connect Neon")
             return
-        if not (self.tcp_thread and self.tcp_thread.conn):
+        if not (self.ipc_thread and self.ipc_thread.conn):
             QMessageBox.information(self, "Info", "Start TCP server")
             return
         
@@ -461,14 +461,14 @@ class MainWindow(QMainWindow):
         chk = getattr(self, "visualize", None)
         if not (chk and chk.isChecked()):
             return
-        if not (self.tcp_thread and self.tcp_thread.conn):
+        if not (self.ipc_thread and self.ipc_thread.conn):
             return
         if "ridge_biquadratic" not in self.models:
             return
         neon_xy_f = np.array([[float(x_f), float(y_f)]], dtype=float)
         neon_xy_n = normalize_neon_xy(neon_xy_f, CANVAS_W, CANVAS_H)
         xy = predict_ridge_biquad(self.models["ridge_biquadratic"], neon_xy_n)[0]
-        self.tcp_thread.send_gaze_visual(ts, float(xy[0]), float(xy[1]))
+        self.ipc_thread.send_gaze_visual(ts, float(xy[0]), float(xy[1]))
 
     def load_models(self):
         model_dir = os.path.join(self.participant_dir, "models")
@@ -567,18 +567,18 @@ class MainWindow(QMainWindow):
         if self.state.step < 25:
             self.state.step += 1
             self.step_label.setText(f"Step: {self.state.step}")
-            if self.tcp_thread:
-                self.tcp_thread.send_step(self.state.step)
+            if self.ipc_thread:
+                self.ipc_thread.send_step(self.state.step)
             if self.state.step == 25:
-                if self.tcp_thread:
-                    self.tcp_thread.send_end_signal()
+                if self.ipc_thread:
+                    self.ipc_thread.send_end_signal()
                 self.state.ended = True
                 self.save_csv()
                 self.state.recording = False
 
     # ---------- Save ----------
     def save_csv(self):
-        if not self.nine_dir:
+        if not self.calib_dir:
             self.ensure_dirs()
         
         gaze_rows = self.state.snapshot_gaze_log()
@@ -589,7 +589,7 @@ class MainWindow(QMainWindow):
             )
             last = df.index[-1]
             df.at[last, "event_log"] = "event_log"
-            gaze_csv = os.path.join(self.nine_dir, "calibration_gaze_log.csv")
+            gaze_csv = os.path.join(self.calib_dir, "calibration_gaze_log.csv")
             df.to_csv(gaze_csv, index=False)
         else:
             gaze_csv = None
@@ -598,7 +598,7 @@ class MainWindow(QMainWindow):
         if pairs_csv:
             self.build_and_save_models(pairs_csv)
         
-        datum_path = os.path.join(self.nine_dir, "raw_neon_data.jsonl")
+        datum_path = os.path.join(self.calib_dir, "raw_neon_data.jsonl")
         with self.state.lock:
             lines = list(self.state.datum_lines)
         if lines:
@@ -632,7 +632,7 @@ class MainWindow(QMainWindow):
                 "avg_gaze_y": avg_gy
             })
         out_df = pd.DataFrame(rows)
-        out_path = os.path.join(self.nine_dir, "calibration_pair.csv")
+        out_path = os.path.join(self.calib_dir, "calibration_pair.csv")
         out_df.to_csv(out_path, index=False)
         return out_path
     
@@ -662,8 +662,8 @@ class MainWindow(QMainWindow):
                 self.device.close()
         except Exception: pass
         try:
-            if self.tcp_thread:
-                self.tcp_thread.close()
+            if self.ipc_thread:
+                self.ipc_thread.close()
         except Exception: pass
         self.close()
 
