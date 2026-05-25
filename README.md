@@ -1,25 +1,60 @@
 # OpenEye
 
-OpenEye: Cross-Device Eye Tracking for Head-Mounted Displays
+# OpenEye: Cross-Device Eye Tracking for Head-Mounted Displays
 
-Gangtae Park, Mingyu Han, and Ian Oakley
+**Gangtae Park, Mingyu Han, and Ian Oakley**  
+*ETRA '26: Symposium on Eye Tracking Research and Applications*
 
-ETRA '26: Symposium on Eye Tracking Research and Applications
+[![DOI](https://img.shields.io/badge/DOI-10.1145%2F3806031-blue)](https://doi.org/10.1145/3806031)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## About
-OpenEye is an open-source framework for **cross-device eye tracking on head-mounted displays (HMDs)**. It provides software and hardware for 3 kinds of devices include:
+---
+
+## Overview
+
+OpenEye is an open-source framework for **cross-device eye tracking on head-mounted displays (HMDs)** using the **Pupil Labs Neon** eye tracker.
+
+The framework provides:
+
+- Cross-device gaze tracking
+- Calibration and mapping pipelines
+- Signal filtering and logging
+- Device-specific processing pipelines
+- 3D-printable hardware mounts
+
+Supported devices:
 
 - Meta Quest 3
 - Apple Vision Pro
 - XREAL Air 2 Ultra
 
-The repository is structured by device-specific directories. Each device directory contains directories GUI Unit, Processing Unit, and hardware mount stl files.
+The project is designed to support reproducible eye-tracking research across heterogeneous XR platforms.
 
-```
-<Device>/  
+---
+
+## Paper
+
+**OpenEye: Cross-Device Eye Tracking for Head-Mounted Displays**  
+Gangtae Park, Mingyu Han, and Ian Oakley
+
+Published in *Proceedings of the ACM on Human-Computer Interaction (PACMHCI), ETRA 2026*.
+
+DOI: https://doi.org/10.1145/3806031
+
+If you use this project in your research, please cite our paper.
+
+---
+
+## Repository Structure
+
+The repository is organized by device-specific directories.
+
+```text
+<Device>/
 ├── gui_unit/
 │   ├── app/
-│   │   ├── app.py
+│   │   └── app.py
+│   │
 │   └── core/
 │       ├── config.py
 │       ├── filter.py
@@ -35,16 +70,29 @@ The repository is structured by device-specific directories. Each device directo
 ├── pyproject.toml
 └── README.md
 ```
-## Quick Start
 
-### 1. Clone the repository
+### Components
+
+| Component | Description |
+|---|---|
+| GUI Unit | Calibration, gaze visualization, filtering, logging |
+| Processing Unit | Device-specific rendering and interaction pipeline |
+| Mount | 3D-printable hardware mount for Neon integration |
+
+---
+
+# Quick Start
+
+## 1. Clone the Repository
 
 ```bash
 git clone https://github.com/witlab-kaist/OpenEye.git
 cd OpenEye
 ```
 
-Or if you only want to use one device (Quest / Vision Pro / XREAL), you can download only that directory using **git sparse-checkout**.
+### Optional: Download Only One Device Directory
+
+If you only need one device implementation:
 
 ```bash
 git clone --filter=blob:none --no-checkout https://github.com/witlab-kaist/OpenEye.git
@@ -52,7 +100,7 @@ cd OpenEye
 
 git sparse-checkout init --cone
 
-# choose one of following
+# Choose one:
 git sparse-checkout set quest
 git sparse-checkout set avp
 git sparse-checkout set xreal
@@ -60,40 +108,74 @@ git sparse-checkout set xreal
 git checkout
 ```
 
-### 2. Install the package
+---
+
+## 2. Install
 
 ```bash
 pip install -e .
 ```
 
-### 3. Run the GUI application
+---
+
+## 3. Run the GUI Application
 
 ```bash
-# choose one of following
+# Choose one:
 openeye-quest-gui
 openeye-avp-gui
 openeye-xreal-gui
 ```
 
-### (Optional) Configuration
+---
 
-Default parameters for specific devices are dfined in:
-```
+## Configuration
+
+Default device-specific parameters are defined in:
+
+```text
 <Device>/gui_unit/core/config.py
 ```
 
-You can override parameters using JSON config file:
+You can override them using a JSON configuration file:
 
 ```bash
-openeye-<Device>-gui --config path/to/config.json
+openeye-<device>-gui --config path/to/config.json
 ```
 
-Typical configurable parameters include:
-- filter parameters (sampling rate, cutoff frequency)
-- mapping model parameters
-- evaluation task parameters
-- canvas resolution
+### Configurable Parameters
+
+- Sampling rate
+- Filter cutoff frequency
+- Mapping model parameters
+- Evaluation task settings
+- Canvas resolution
+
+---
 
 ## Citation
 
-## License
+```bibtex
+@article{park26openeye,
+  author = {Park, Gangtae and Han, Mingyu and Oakley, Ian},
+  title = {OpenEye: Cross-Device Eye Tracking for Head-Mounted Displays},
+  journal = {Proceedings of the ACM on Human-Computer Interaction},
+  volume = {10},
+  number = {ETRA},
+  articleno = {ETRA017},
+  year = {2026},
+  month = {may},
+  pages = {1--17},
+  doi = {10.1145/3806031},
+  publisher = {ACM}
+}
+```
+
+## Acknowledgments
+
+This work was supported by:
+
+- National Research Foundation of Korea (NRF)
+- IITP (Institute of Information & Communications Technology Planning & Evaluation)
+
+as described in the accompanying paper.
