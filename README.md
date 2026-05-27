@@ -29,19 +29,6 @@ The project is designed to support reproducible eye-tracking research across het
 
 ---
 
-## Paper
-
-**OpenEye: Cross-Device Eye Tracking for Head-Mounted Displays**  
-Gangtae Park, Mingyu Han, and Ian Oakley
-
-Published in *Proceedings of the ACM on Human-Computer Interaction (PACMHCI), ETRA 2026*.
-
-DOI: https://doi.org/10.1145/3806031
-
-If you use this project in your research, please cite our paper.
-
----
-
 ## Repository Structure
 
 The repository is organized by device-specific directories.
