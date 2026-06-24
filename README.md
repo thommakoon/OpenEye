@@ -140,18 +140,22 @@ openeye-<device>-gui --config path/to/config.json
 ## Citation
 
 ```bibtex
-@article{park26openeye,
-  author = {Park, Gangtae and Han, Mingyu and Oakley, Ian},
-  title = {OpenEye: Cross-Device Eye Tracking for Head-Mounted Displays},
-  journal = {Proceedings of the ACM on Human-Computer Interaction},
-  volume = {10},
-  number = {ETRA},
-  articleno = {ETRA017},
-  year = {2026},
-  month = {may},
-  pages = {1--17},
-  doi = {10.1145/3806031},
-  publisher = {ACM}
+@article{10.1145/3806031,
+author = {Park, Gangtae and Han, Mingyu and Oakley, Ian},
+title = {OpenEye: Cross-Device Eye Tracking for Head-Mounted Displays},
+year = {2026},
+issue_date = {May 2026},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+volume = {10},
+number = {3},
+url = {https://doi.org/10.1145/3806031},
+doi = {10.1145/3806031},
+journal = {Proc. ACM Hum.-Comput. Interact.},
+month = may,
+articleno = {ETRA017},
+numpages = {17},
+keywords = {Eye Tracking, HMD, Evaluation, Toolkit}
 }
 ```
 
