@@ -53,7 +53,7 @@ public class NeonGazeInputManagerPlane : MonoBehaviour
                             + forwardFlat * planeDistMeters
                             + upWorld * verticalOffsetMeters;
 
-        Vector2 gazePlanePos = gazeViz.lastPlaneHitPos;
+        Vector2 gazePlanePos = GetGazePlanePos(planeCenter, forwardFlat, rightFlat, upWorld);
 
         bool pinchNow = (pinchDetector != null && pinchDetector.pinchDownThisFrame);
         if (!pinchNow) return;
@@ -116,5 +116,29 @@ public class NeonGazeInputManagerPlane : MonoBehaviour
         {
             Debug.Log("[NEON] GazeVisualizer hooked");
         }
+    }
+
+    private Vector2 GetGazePlanePos(
+        Vector3 planeCenter,
+        Vector3 planeNormal,
+        Vector3 rightFlat,
+        Vector3 upWorld)
+    {
+        if (ServiceLocator.Instance == null || ServiceLocator.Instance.GazeDataProvider == null)
+            return Vector2.zero;
+
+        Ray gazeRay = ServiceLocator.Instance.GazeDataProvider.GazeRay;
+        Vector3 dir = gazeRay.direction;
+        float denom = Vector3.Dot(dir, planeNormal);
+        if (Mathf.Abs(denom) < 1e-6f)
+            return Vector2.zero;
+
+        float t = Vector3.Dot(planeCenter - gazeRay.origin, planeNormal) / denom;
+        if (t < 0f)
+            return Vector2.zero;
+
+        Vector3 hit = gazeRay.origin + dir * t;
+        Vector3 local = hit - planeCenter;
+        return new Vector2(Vector3.Dot(local, rightFlat), Vector3.Dot(local, upWorld));
     }
 }

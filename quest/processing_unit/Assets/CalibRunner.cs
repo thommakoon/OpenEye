@@ -37,6 +37,7 @@ public class CalibRunner : MonoBehaviour
         {
             tcp.OnUpdateStep    += HandleStep;
             tcp.OnCalibrationEnd += HandleEnd;
+            tcp.OnResetCalibration += HandleReset;
             tcp.OnEvalTarget    += HandleEvalTarget;
             tcp.OnStateChanged  += HandleState;
         }
@@ -48,6 +49,7 @@ public class CalibRunner : MonoBehaviour
         {
             tcp.OnUpdateStep    -= HandleStep;
             tcp.OnCalibrationEnd -= HandleEnd;
+            tcp.OnResetCalibration -= HandleReset;
             tcp.OnEvalTarget    -= HandleEvalTarget;
             tcp.OnStateChanged  -= HandleState;
         }
@@ -57,12 +59,13 @@ public class CalibRunner : MonoBehaviour
     {
         if (s == TCPClient.State.Connected)
         {
-            evalMode = false;
-            grid.ShowStep(0);
             _lastSeenGazeSeq = 0;
+            if (!evalMode)
+                grid?.HideDot();
         }
         else if (s == TCPClient.State.Disconnected || s == TCPClient.State.Failed)
         {
+            evalMode = false;
             grid?.HideDot();
             _lastSeenGazeSeq = 0;
         }
@@ -78,6 +81,14 @@ public class CalibRunner : MonoBehaviour
     void HandleEnd()
     {
         evalMode = true;
+        grid?.HideDot();
+    }
+
+    void HandleReset()
+    {
+        evalMode = false;
+        _lastSeenGazeSeq = 0;
+        if (_hideCo != null) StopCoroutine(_hideCo);
         grid?.HideDot();
     }
 

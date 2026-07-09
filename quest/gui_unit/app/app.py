@@ -10,7 +10,7 @@ from typing import Optional, List, Dict
 import pandas as pd
 import numpy as np
 # ---- PySide6 GUI ----
-from PySide6.QtCore import Qt, QTimer, QPointF
+from PySide6.QtCore import Qt, QTimer, QPointF, Signal
 from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -261,6 +261,9 @@ class GazeCanvas(QLabel):
 # ==============================
 
 class MainWindow(QMainWindow):
+    _tcp_status_changed = Signal(str)
+    _remote_next_step = Signal()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Quest-Neon Calibration")
@@ -301,6 +304,17 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self.btn_start_tcp); ctrl_layout.addWidget(self.tcp_status)
         ctrl_layout.addWidget(self.step_label)
 
+        calib_box = QGroupBox("Calibration"); calib_layout = QHBoxLayout(calib_box)
+        self.btn_start_calib = QPushButton("Start Calibration (S)")
+        self.btn_next_step = QPushButton("Next Step (Space)")
+        self.btn_reset_calib = QPushButton("Reset Calibration")
+        self.btn_next_step.setEnabled(False)
+        self.calib_hint = QLabel("1. Connect Neon  2. Start TCP  3. Launch Quest  4. Start Calibration  5. Fixate each dot, Next Step ×25")
+        calib_layout.addWidget(self.btn_start_calib)
+        calib_layout.addWidget(self.btn_next_step)
+        calib_layout.addWidget(self.btn_reset_calib)
+        calib_layout.addWidget(self.calib_hint, stretch=1)
+
         self.canvas = GazeCanvas()
         task_box = QGroupBox("Tasks"); task_layout = QHBoxLayout(task_box)
 
@@ -309,13 +323,30 @@ class MainWindow(QMainWindow):
         self.visualize = QCheckBox("Visualize")
         task_layout.addWidget(self.btn_eval); task_layout.addWidget(self.btn_track); task_layout.addWidget(self.visualize)
 
-        root.addWidget(ctrl_box); root.addWidget(self.canvas); root.addWidget(task_box)
+        study_box = QGroupBox("Study Handoff"); study_layout = QHBoxLayout(study_box)
+        self.btn_launch_study = QPushButton("Start Study (Open Fitts App on Quest)")
+        self.btn_recalibrate = QPushButton("Recalibrate (Open OpenEye on Quest)")
+        self.study_hint = QLabel(
+            "Start Study: OpenEye → PracticeTask.  Recalibrate: PracticeTask → OpenEye."
+        )
+        study_layout.addWidget(self.btn_launch_study)
+        study_layout.addWidget(self.btn_recalibrate)
+        study_layout.addWidget(self.study_hint, stretch=1)
+
+        root.addWidget(ctrl_box); root.addWidget(calib_box); root.addWidget(self.canvas); root.addWidget(task_box); root.addWidget(study_box)
 
         # wiring
         self.btn_connect_neon.clicked.connect(self.on_connect_neon)
         self.btn_start_tcp.clicked.connect(self.on_start_tcp)
+        self.btn_start_calib.clicked.connect(self.on_start_recording)
+        self.btn_next_step.clicked.connect(self.trigger_step)
+        self.btn_reset_calib.clicked.connect(self.on_reset_calibration)
+        self._tcp_status_changed.connect(self._apply_tcp_status)
+        self._remote_next_step.connect(self.trigger_step)
         self.btn_eval.clicked.connect(self.on_toggle_evaluation)
         self.btn_track.clicked.connect(self.on_toggle_gaze_tracking)
+        self.btn_launch_study.clicked.connect(self.on_launch_study)
+        self.btn_recalibrate.clicked.connect(self.on_recalibrate)
 
         # UI update timer
         self.timer = QTimer(self); self.timer.timeout.connect(self.repaint_canvas); self.timer.start(5)
@@ -340,8 +371,11 @@ class MainWindow(QMainWindow):
         self.shortcut_q.activated.connect(self.cleanup_and_close)
 
     # ---- Helpers ----
-    def status_tcp(self, msg):
+    def _apply_tcp_status(self, msg: str):
         self.tcp_status.setText(f"TCP: {msg}")
+
+    def status_tcp(self, msg):
+        self._tcp_status_changed.emit(msg)
 
     def repaint_canvas(self):
         with self.state.lock:
@@ -355,7 +389,7 @@ class MainWindow(QMainWindow):
         self.calib_dir = os.path.join(self.participant_dir, "calibration")
         os.makedirs(self.calib_dir, exist_ok=True)
     
-    def stream_gaze_visual(self, ts: float, x_f: float, y_f: float):
+    def stream_gaze_visual(self, ts: float, x_f: float, y_f: float, x_raw: float = 0.0, y_raw: float = 0.0):
         with self._gv_lock:
             self._gv_latest_raw = (float(ts), float(x_f), float(y_f))
 
@@ -404,22 +438,65 @@ class MainWindow(QMainWindow):
 
     # ---- REC ----
     def on_start_recording(self):
+        if not self.device or not self.gaze_thread:
+            QMessageBox.information(self, "Calibration", "Connect Neon first.")
+            return
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            QMessageBox.information(self, "Calibration", "Start TCP server and connect the Quest app first.")
+            return
         if self.state.recording:
             QMessageBox.information(self, "Recording", "Already recording.")
             return
         self.ensure_dirs()
+        with self.state.lock:
+            self.state.gaze_log.clear()
+            self.state.datum_lines.clear()
         self.state.step = 0
         self.state.ended = False
         self.state.recording = True
-        self.step_label.setText("Step: 0")
+        self.step_label.setText("Step: 1 / 25 — fixate, then Next")
+        self.btn_start_calib.setEnabled(False)
+        self.btn_next_step.setEnabled(True)
+        if self.tcp_thread and self.tcp_thread.conn:
+            self.tcp_thread.send_reset_calib()
+            self.tcp_thread.send_step(0)
+
+    def on_reset_calibration(self):
+        with self.state.lock:
+            self.state.gaze_log.clear()
+            self.state.datum_lines.clear()
+        self.state.step = 0
+        self.state.ended = False
+        self.state.recording = False
+        self.step_label.setText("Step: idle")
+        self.btn_start_calib.setEnabled(True)
+        self.btn_next_step.setEnabled(False)
+        if self.tracking_active:
+            self.on_toggle_gaze_tracking()
+        if self.eval_active:
+            self.on_toggle_evaluation()
+        if self.tcp_thread and self.tcp_thread.conn:
+            self.tcp_thread.send_reset_calib()
 
     # ---- TCP ----
     def on_start_tcp(self):
-        if self.tcp_thread and self.tcp_thread.conn:
-            self.status_tcp("already connected")
+        if self.tcp_thread and self.tcp_thread.is_alive():
+            if self.tcp_thread.conn:
+                self.status_tcp("already connected")
+            else:
+                from ..core.networking import HOST, PORT
+                self.status_tcp(f"Waiting...{HOST}:{PORT}")
             return
-        self.tcp_thread = TcpServer(self.status_tcp)
+        self.tcp_thread = TcpServer(self.status_tcp, message_cb=self.on_tcp_message)
         self.tcp_thread.start()
+
+    def on_tcp_message(self, msg: dict):
+        # Runs on the TCP thread; marshal to GUI thread via signals.
+        mtype = msg.get("type", "") if isinstance(msg, dict) else ""
+        if mtype == "nextStep":
+            # Only honor pinch during active calibration; ignore stray pinches.
+            if self.state.recording and not self.state.ended:
+                self._remote_next_step.emit()
 
     # ---- Evaluation ----
     def start_evaluation_logging(self):
@@ -476,7 +553,9 @@ class MainWindow(QMainWindow):
             return
         
         if not self.tracking_active:
-            self.load_models()
+            if not self.load_models():
+                return
+            self.visualize.setChecked(True)
             self.start_gaze_logging()
             self.tracking_active = True
             self.btn_track.setText("Stop")
@@ -491,6 +570,59 @@ class MainWindow(QMainWindow):
             self.gaze_tx_timer.stop()
             with self._gv_lock:
                 self._gv_latest_raw = None
+
+    # ---- Study handoff ----
+    def on_launch_study(self):
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            QMessageBox.information(self, "Start Study", "Start the TCP server and connect the Quest app first.")
+            return
+
+        confirm = QMessageBox.question(
+            self, "Start Study",
+            "Launch the Fitts study app on the Quest and close OpenEye there?\n"
+            "Make sure calibration looks good first.",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        # Stop the calibration-eval saccade stream, but KEEP gaze tracking running:
+        # after PracticeTask reconnects, the PC auto-resumes streaming gazeVisual to it.
+        if self.eval_active:
+            self.on_toggle_evaluation()
+
+        if not self.tracking_active:
+            QMessageBox.information(
+                self, "Start Study",
+                "Note: Gaze Tracking is OFF. Eye blocks in PracticeTask will have no gaze "
+                "until you press 'Start Gaze Tracking' (with Visualize) here after it connects."
+            )
+
+        self.tcp_thread.send_launch_app()
+        self.step_label.setText("Step: launching study app on Quest (gaze streaming stays on)...")
+
+    def on_recalibrate(self):
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            QMessageBox.information(
+                self, "Recalibrate",
+                "Start the TCP server and connect PracticeTask on the Quest first.",
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self, "Recalibrate",
+            "Launch the OpenEye calibration app on the Quest and close PracticeTask?\n"
+            "After calibration, use Start Study to return to the Fitts app.",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        if self.eval_active:
+            self.on_toggle_evaluation()
+        if self.tracking_active:
+            self.on_toggle_gaze_tracking()
+
+        self.tcp_thread.send_launch_app("org.MixedRealityToolkit.MRTK3Sample")
+        self.step_label.setText("Step: launching OpenEye on Quest for recalibration...")
 
     def load_models(self):
         model_dir = os.path.join(self.participant_dir, "models")
@@ -576,6 +708,18 @@ class MainWindow(QMainWindow):
         print(f"[EVAL] saved: {self.plan_path}")
         return self.plan_path
 
+    def _gaze_event_count(self) -> int:
+        with self.state.lock:
+            return sum(1 for row in self.state.gaze_log if row[5] == "event_log")
+
+    def _wait_for_gaze_event(self, prev_count: int, timeout_s: float = 1.0) -> bool:
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
+            if self._gaze_event_count() > prev_count:
+                return True
+            time.sleep(0.005)
+        return False
+
     # ---- Step / End ----
     def trigger_step(self):
         if self.state.ended:
@@ -583,33 +727,51 @@ class MainWindow(QMainWindow):
         if not self.state.recording:
             QMessageBox.information(self, "Info", "Press 'S' to start recording first.")
             return
-        
+
+        prev_events = self._gaze_event_count()
+        # Log gaze for the dot currently shown (step is 0-based dot index).
         self.state.set_event()
-        if self.state.step < 25:
+
+        if self.state.step < 24:
             self.state.step += 1
-            self.step_label.setText(f"Step: {self.state.step}")
-            if self.tcp_thread:
+            if self.tcp_thread and self.tcp_thread.conn:
                 self.tcp_thread.send_step(self.state.step)
-            if self.state.step == 25:
-                if self.tcp_thread:
-                    self.tcp_thread.send_end_signal()
-                self.state.ended = True
-                self.save_csv()
-                self.state.recording = False
+            self.step_label.setText(f"Step: {self.state.step + 1} / 25 — fixate, then Next")
+        else:
+            if not self._wait_for_gaze_event(prev_events):
+                print("[CALIB] timed out waiting for final gaze event")
+            if self.tcp_thread and self.tcp_thread.conn:
+                self.tcp_thread.send_end_signal()
+            self.state.ended = True
+            model_dir = self.save_csv()
+            self.state.recording = False
+            self.btn_start_calib.setEnabled(True)
+            self.btn_next_step.setEnabled(False)
+            self.step_label.setText("Step: done")
+            if model_dir:
+                QMessageBox.information(
+                    self, "Calibration",
+                    f"Calibration complete.\nModels saved to:\n{model_dir}",
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Calibration",
+                    "Calibration finished but models were NOT saved.\n"
+                    "Check the terminal for [CALIB] errors (need 25 gaze events).",
+                )
 
     # ---- Save ----
     def save_csv(self):
         if not self.calib_dir:
             self.ensure_dirs()
-        
+
+        model_path = None
         gaze_rows = self.state.snapshot_gaze_log()
         if gaze_rows:
             df = pd.DataFrame(
                 gaze_rows,
                 columns=["timestamp", "gaze_x", "gaze_y", "raw_gaze_x", "raw_gaze_y", "event_log"]
             )
-            last = df.index[-1]
-            df.at[last, "event_log"] = "event_log"
             calib_csv = os.path.join(self.calib_dir, "calibration_log.csv")
             df.to_csv(calib_csv, index=False)
         else:
@@ -617,8 +779,10 @@ class MainWindow(QMainWindow):
 
         pairs_csv = self.build_mapping(calib_csv) if calib_csv else None
         if pairs_csv:
-            self.build_and_save_models(pairs_csv)
-        
+            model_path = self.build_and_save_models(pairs_csv)
+        else:
+            print("[CALIB] calibration_pair.csv not created — models skipped")
+
         datum_path = os.path.join(self.calib_dir, "raw_neon_data.jsonl")
         with self.state.lock:
             lines = list(self.state.datum_lines)
@@ -627,16 +791,20 @@ class MainWindow(QMainWindow):
                 for line in lines:
                     f.write(line+"\n")
 
+        return model_path
+
     # ---- Mapping ----
     def build_mapping(self, calib_csv_path: str, window: int=CFG.mapping.window_width):
         if not os.path.exists(calib_csv_path):
             return None
         df = pd.read_csv(calib_csv_path)
         ev = df["event_log"].astype(str).fillna("")
-        event_idxs = list(np.flatnonzero(ev == "event_log"))[:25]
-        if not event_idxs:
+        event_idxs = list(np.flatnonzero(ev == "event_log"))
+        if len(event_idxs) < 25:
+            print(f"[CALIB] expected 25 gaze events, found {len(event_idxs)}")
             return None
-        
+        event_idxs = event_idxs[:25]
+
         rows = []
         for seq_idx, i in enumerate(event_idxs):
             start = max(0, i - window)

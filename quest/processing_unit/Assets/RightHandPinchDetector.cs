@@ -1,7 +1,6 @@
 using UnityEngine;
 using MixedReality.Toolkit.Input;
 using UnityEngine.XR.Interaction.Toolkit;
-using UnityEditorInternal;
 
 public class RightHandPinchDetector : MonoBehaviour
 {

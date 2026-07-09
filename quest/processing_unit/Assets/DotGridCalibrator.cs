@@ -39,6 +39,7 @@ public class DotGridCalibrator : MonoBehaviour
     {
         if (_mode == Mode.None || _dot == null) return;
 
+        if (xrCamera == null) xrCamera = Camera.main;
         var refTf = referenceForward ? referenceForward : (xrCamera ? xrCamera.transform : null);
         if (refTf == null) return;
 

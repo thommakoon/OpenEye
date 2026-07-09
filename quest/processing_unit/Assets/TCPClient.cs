@@ -11,10 +11,13 @@ using UnityEngine.SceneManagement;
 [Serializable] public class PayloadEval { public int idx; public int t_ms; public Pos pos; }
 [Serializable] public class PayloadGaze { public double t; public float x; public float y; }
 
+[Serializable] public class PayloadLaunch { public string package; }
+
 [Serializable] class MsgTypeOnly { public string type; }
 [Serializable] class MsgUpdateStep { public string type; public PayloadStep payload; }
 [Serializable] class MsgEvalTarget { public string type; public PayloadEval payload; }
 [Serializable] class MsgGaze { public string type; public PayloadGaze payload; }
+[Serializable] class MsgLaunch { public string type; public PayloadLaunch payload; }
 
 public class TCPClient : MonoBehaviour
 {
@@ -42,12 +45,17 @@ public class TCPClient : MonoBehaviour
 
     public event Action<int> OnUpdateStep;                 // step
     public event Action OnCalibrationEnd;                  // calib end
+    public event Action OnResetCalibration;
     public event Action<int,int,Vector2> OnEvalTarget;     // (idx, t_ms, (x_m, y_m))
     public event Action<double,Vector2> OnGazeVisual;
     public event Action<State> OnStateChanged;
+    public event Action<string> OnLaunchApp;               // package name (may be empty)
 
     volatile int _pendingStep = -1;
     volatile bool _pendingCalibEnd = false;
+    volatile bool _pendingResetCalib = false;
+    volatile bool _pendingLaunchApp = false;
+    volatile string _pendingLaunchPackage = "";
 
     struct EvalMsg { public int idx, tms; public Vector2 p_m; }
     volatile bool _hasLatestEval = false;
@@ -56,6 +64,7 @@ public class TCPClient : MonoBehaviour
     public struct GazeMsg { public double t; public Vector2 p; }
 
     public string nextSceneName = "PL_Calibration_OpenCV";
+    [SerializeField] bool loadSceneOnCalibEnd = false;
 
     public volatile float latestGazeX;
     public volatile float latestGazeY;
@@ -200,7 +209,22 @@ public class TCPClient : MonoBehaviour
                         case "calibrationEnd":
                         {
                             _pendingCalibEnd = true;
-                            SceneManager.LoadScene(nextSceneName);
+                            if (loadSceneOnCalibEnd && !string.IsNullOrEmpty(nextSceneName))
+                                SceneManager.LoadScene(nextSceneName);
+                            break;
+                        }
+
+                        case "resetCalib":
+                        {
+                            _pendingResetCalib = true;
+                            break;
+                        }
+
+                        case "launchApp":
+                        {
+                            var msg = JsonUtility.FromJson<MsgLaunch>(json);
+                            _pendingLaunchPackage = msg?.payload?.package ?? "";
+                            _pendingLaunchApp = true;
                             break;
                         }
 
@@ -257,6 +281,45 @@ public class TCPClient : MonoBehaviour
         }
 
         Disconnect();
+    }
+
+    readonly object _sendLock = new object();
+
+    /// <summary>
+    /// Send a simple control message to the PC server, e.g. type="nextStep".
+    /// Safe to call from the main thread.
+    /// </summary>
+    public bool SendControl(string type)
+    {
+        var stream = _stream;
+        if (stream == null || CurrentState != State.Connected)
+            return false;
+
+        try
+        {
+            string json = "{\"type\":\"" + type + "\",\"payload\":{}}";
+            byte[] payload = Encoding.UTF8.GetBytes(json);
+            int len = payload.Length;
+            byte[] header = new byte[4]
+            {
+                (byte)((len >> 24) & 0xFF),
+                (byte)((len >> 16) & 0xFF),
+                (byte)((len >> 8) & 0xFF),
+                (byte)(len & 0xFF),
+            };
+            lock (_sendLock)
+            {
+                stream.Write(header, 0, 4);
+                stream.Write(payload, 0, payload.Length);
+                stream.Flush();
+            }
+            return true;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[TCP] SendControl failed: {e.Message}");
+            return false;
+        }
     }
 
     static async Task ReadExactAsync(NetworkStream s, byte[] buf, int off, int len, CancellationToken token)
@@ -319,6 +382,20 @@ public class TCPClient : MonoBehaviour
         {
             _pendingCalibEnd = false;
             OnCalibrationEnd?.Invoke();
+        }
+
+        // 1b) resetCalib
+        if (_pendingResetCalib)
+        {
+            _pendingResetCalib = false;
+            OnResetCalibration?.Invoke();
+        }
+
+        // 1c) launchApp (PC-driven handoff)
+        if (_pendingLaunchApp)
+        {
+            _pendingLaunchApp = false;
+            OnLaunchApp?.Invoke(_pendingLaunchPackage);
         }
 
         // 2) updateStep

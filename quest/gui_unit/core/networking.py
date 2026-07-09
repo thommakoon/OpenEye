@@ -8,12 +8,14 @@ from typing import Optional, Tuple
 HOST, PORT = "0.0.0.0", 5051
 
 class TcpServer(threading.Thread):
-    def __init__(self, status_cb):
+    def __init__(self, status_cb, message_cb=None):
         super().__init__(daemon=True)
         self.status_cb = status_cb
+        self.message_cb = message_cb  # called (thread) with parsed dict from Quest
         self.server: Optional[socket.socket] = None
         self.conn: Optional[socket.socket] = None
         self.addr: Optional[Tuple[str, int]] = None
+        self._stop = False
 
     def run(self):
         try:
@@ -21,12 +23,69 @@ class TcpServer(threading.Thread):
             self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server.bind((HOST, PORT))
             self.server.listen(1)
-            self.status_cb(f"Waiting...{HOST}:{PORT}")
-
-            self.conn, self.addr = self.server.accept()
-            self.status_cb(f"Connected: {self.addr}")
         except Exception as e:
             self.status_cb(f"TCP error: {e}")
+            return
+
+        # Accept loop: keep serving new clients (e.g. after OpenEye hands off
+        # to PracticeTask, PracticeTask connects as a fresh client).
+        while not self._stop:
+            self.status_cb(f"Waiting...{HOST}:{PORT}")
+            try:
+                conn, addr = self.server.accept()
+            except OSError:
+                break  # server socket closed
+            if self._stop:
+                try: conn.close()
+                except Exception: pass
+                break
+            self.conn, self.addr = conn, addr
+            self.status_cb(f"Connected: {self.addr}")
+            try:
+                self._recv_loop()
+            except Exception as e:
+                self.status_cb(f"recv error: {e}")
+            finally:
+                try:
+                    if self.conn:
+                        self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+
+    def _recv_exact(self, n: int) -> Optional[bytes]:
+        buf = b""
+        while len(buf) < n:
+            chunk = self.conn.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def _recv_loop(self):
+        while True:
+            header = self._recv_exact(4)
+            if header is None:
+                self.status_cb("Quest disconnected")
+                return
+            length = int.from_bytes(header, byteorder="big")
+            if length <= 0 or length > 10_000_000:
+                self.status_cb(f"bad length: {length}")
+                return
+            payload = self._recv_exact(length)
+            if payload is None:
+                self.status_cb("Quest disconnected")
+                return
+            try:
+                msg = json.loads(payload.decode("utf-8"))
+            except Exception as e:
+                print(f"[TCP] parse error: {e}")
+                continue
+            if self.message_cb is not None:
+                try:
+                    self.message_cb(msg)
+                except Exception as e:
+                    print(f"[TCP] message_cb error: {e}")
 
     def _send(self, msg: dict):
         if not self.conn:
@@ -44,6 +103,12 @@ class TcpServer(threading.Thread):
 
     def send_end_signal(self):
         self._send({"type": "calibrationEnd", "payload": {}})
+
+    def send_reset_calib(self):
+        self._send({"type": "resetCalib", "payload": {}})
+
+    def send_launch_app(self, package: str = ""):
+        self._send({"type": "launchApp", "payload": {"package": str(package)}})
 
     def send_eval_target(self, idx: int, t_ms: int, pos: tuple[float, float]):
         self._send({
@@ -63,6 +128,7 @@ class TcpServer(threading.Thread):
         print(ts, x, y)
 
     def close(self):
+        self._stop = True
         try:
             if self.conn:
                 self.conn.close()

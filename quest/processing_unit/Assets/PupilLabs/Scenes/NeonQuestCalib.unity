@@ -164,6 +164,8 @@ GameObject:
   - component: {fileID: 1878009573}
   - component: {fileID: 1878009572}
   - component: {fileID: 1878009575}
+  - component: {fileID: 1878009576}
+  - component: {fileID: 1878009577}
   m_Layer: 0
   m_Name: Networking
   m_TagString: Untagged
@@ -206,13 +208,14 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: ac05f1eafc6851d4da7dabd58ebfd031, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  serverIp: 192.168.0.2
+  serverIp: 192.168.0.245
   serverPort: 5051
   autoConnectOnStart: 1
   autoReconnect: 1
   reconnectIntervalSec: 2
   logEveryN: 10
   nextSceneName: PL_Calibration_OpenCV
+  loadSceneOnCalibEnd: 0
   latestGazeX: 0
   latestGazeY: 0
   GazeTimestamp: 0
@@ -254,6 +257,37 @@ MonoBehaviour:
   gazeDisplayHz: 200
   gazeSmoothLerp: 1
   gazeLerpFactor: 0.4
+--- !u!114 &1878009576
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1878009571}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 228cc420698d3bf41ad15970e18fde23, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  practiceTaskPackageName: com.PracticeMG.MRstressPRACTICE
+  tcp: {fileID: 1878009573}
+  disconnectDelaySec: 0.3
+--- !u!114 &1878009577
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1878009571}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4666b112dd7e6494c95635382e25e826, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  tcp: {fileID: 1878009573}
+  pinchThreshold: 0.9
+  cooldownSec: 0.6
+  allowLeftHand: 1
 --- !u!1001 &2038162838
 PrefabInstance:
   m_ObjectHideFlags: 0
