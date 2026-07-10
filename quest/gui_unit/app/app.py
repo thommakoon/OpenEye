@@ -296,6 +296,7 @@ class GazeCanvas(QLabel):
 class MainWindow(QMainWindow):
     _tcp_status_changed = Signal(str)
     _remote_next_step = Signal()
+    _sync_pulse_record = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -318,6 +319,8 @@ class MainWindow(QMainWindow):
         self._gv_lock = threading.Lock()
         self._gv_latest_raw = None
         self._gaze_tx_thread: Optional[GazeTxThread] = None
+        self._sync_pulse_logger: Optional[JsonLogger] = None
+        self.sync_pulses_path = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -375,6 +378,7 @@ class MainWindow(QMainWindow):
         self.btn_reset_calib.clicked.connect(self.on_reset_calibration)
         self._tcp_status_changed.connect(self._apply_tcp_status)
         self._remote_next_step.connect(self.trigger_step)
+        self._sync_pulse_record.connect(self._on_sync_pulse_record)
         self.btn_eval.clicked.connect(self.on_toggle_evaluation)
         self.btn_track.clicked.connect(self.on_toggle_gaze_tracking)
         self.btn_launch_study.clicked.connect(self.on_launch_study)
@@ -420,6 +424,13 @@ class MainWindow(QMainWindow):
         self.participant_dir = participant_id
         self.calib_dir = os.path.join(self.participant_dir, "calibration")
         os.makedirs(self.calib_dir, exist_ok=True)
+
+    def _ensure_sync_pulse_logger(self):
+        self.ensure_dirs()
+        if self._sync_pulse_logger is None:
+            self.sync_pulses_path = os.path.join(self.participant_dir, "sync_pulses.jsonl")
+            self._sync_pulse_logger = JsonLogger(self.sync_pulses_path)
+            self._sync_pulse_logger.start()
     
     def stream_gaze_visual(self, ts: float, ts_ns: int, x_f: float, y_f: float, x_raw: float = 0.0, y_raw: float = 0.0):
         with self._gv_lock:
@@ -540,10 +551,44 @@ class MainWindow(QMainWindow):
     def on_tcp_message(self, msg: dict):
         # Runs on the TCP thread; marshal to GUI thread via signals.
         mtype = msg.get("type", "") if isinstance(msg, dict) else ""
+        if mtype == "syncPulse":
+            payload = msg.get("payload") or {}
+            recv_ns = time.time_ns()
+            self._sync_pulse_record.emit({
+                "type": "syncPulse",
+                "seq": payload.get("seq"),
+                "quest_sent_unix_ms": payload.get("quest_sent_unix_ms"),
+                "pc_recv_unix_ms": recv_ns // 1_000_000,
+                "pc_recv_unix_ns": recv_ns,
+            })
+            return
         if mtype == "nextStep":
             # Only honor pinch during active calibration; ignore stray pinches.
             if self.state.recording and not self.state.ended:
                 self._remote_next_step.emit()
+
+    def _on_sync_pulse_record(self, record: dict):
+        if self.device:
+            try:
+                ev = self.device.send_event("quest_sync", int(record["pc_recv_unix_ns"]))
+                record["neon_event_name"] = ev.name
+                record["neon_event_ns"] = int(ev.timestamp)
+                record["neon_event_ok"] = True
+            except Exception as e:
+                record["neon_event_ok"] = False
+                record["neon_event_error"] = str(e)
+                print(f"[syncPulse] send_event failed: {e}")
+        else:
+            record["neon_event_ok"] = False
+            record["neon_event_error"] = "neon_not_connected"
+            print("[syncPulse] Neon not connected; skipped send_event")
+
+        self._ensure_sync_pulse_logger()
+        self._sync_pulse_logger.log(record)
+        print(
+            f"[syncPulse] seq={record['seq']} quest_ms={record['quest_sent_unix_ms']} "
+            f"pc_ms={record['pc_recv_unix_ms']} neon_ns={record.get('neon_event_ns')}"
+        )
 
     # ---- Evaluation ----
     def start_evaluation_logging(self):
