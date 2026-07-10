@@ -14,6 +14,7 @@ class TcpServer(threading.Thread):
         self.server: Optional[socket.socket] = None
         self.conn: Optional[socket.socket] = None
         self.addr: Optional[Tuple[str, int]] = None
+        self._send_lock = threading.Lock()
 
     def run(self):
         try:
@@ -24,18 +25,24 @@ class TcpServer(threading.Thread):
             self.status_cb(f"Waiting...{HOST}:{PORT}")
 
             self.conn, self.addr = self.server.accept()
+            try:
+                self.conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             self.status_cb(f"Connected: {self.addr}")
         except Exception as e:
             self.status_cb(f"TCP error: {e}")
 
-    def _send(self, msg: dict):
+    def _send(self, msg: dict, *, quiet: bool = False):
         if not self.conn:
             return
         try:
             payload = json.dumps(msg).encode("utf-8")
             header = len(payload).to_bytes(4, byteorder="big")
-            self.conn.sendall(header + payload)
-            print(f"sent: {msg}")
+            with self._send_lock:
+                self.conn.sendall(header + payload)
+            if not quiet:
+                print(f"sent: {msg}")
         except Exception as e:
             self.status_cb(f"send message error: {e}")
 
@@ -59,11 +66,8 @@ class TcpServer(threading.Thread):
         payload = {"t": float(ts), "x": float(x), "y": float(y)}
         if ts_ns is not None:
             payload["t_ns"] = int(ts_ns)
-        self._send({
-            "type": "gazeVisual",
-            "payload": payload,
-        })
-        print(payload.get("t_ns", ts), x, y)
+        # High-rate path: skip console I/O (was a major cost at 30–100 Hz).
+        self._send({"type": "gazeVisual", "payload": payload}, quiet=True)
 
     def close(self):
         try:

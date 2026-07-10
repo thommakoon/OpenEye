@@ -191,6 +191,35 @@ class SharedState:
             out["ridge_biquadratic"] = {"x": float(xy[0]), "y": float(xy[1])}
         return out
 
+class GazeTxThread(threading.Thread):
+    """Latest-wins TCP sender off the Qt GUI thread."""
+
+    def __init__(self, main_window: "MainWindow", rate_hz: float = 100.0):
+        super().__init__(daemon=True)
+        self.mw = main_window
+        self.rate_hz = float(rate_hz)
+        self._running = threading.Event()
+        self._running.set()
+
+    def stop(self):
+        self._running.clear()
+
+    def run(self):
+        interval = 1.0 / max(1.0, self.rate_hz)
+        next_t = time.perf_counter()
+        while self._running.is_set():
+            try:
+                self.mw._send_latest_gaze_visual()
+            except Exception:
+                pass
+            next_t += interval
+            sleep_dur = next_t - time.perf_counter()
+            if sleep_dur > 0:
+                time.sleep(sleep_dur)
+            else:
+                # Fell behind: resync so we keep sending latest, not a backlog.
+                next_t = time.perf_counter()
+
 class GazeCollector(threading.Thread):
     def __init__(self, device, state: SharedState, filter: ButterLPFilter):
         super().__init__(daemon=True)
@@ -285,11 +314,10 @@ class MainWindow(QMainWindow):
         self.eval_log_path = None
         self.eval_log_dir = None
 
-        self.gv_rate_hz = 30
+        self.gv_rate_hz = 100
         self._gv_lock = threading.Lock()
         self._gv_latest_raw = None
-        self.gaze_tx_timer = QTimer(self)
-        self.gaze_tx_timer.timeout.connect(self._tick_send_gaze)
+        self._gaze_tx_thread: Optional[GazeTxThread] = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -397,12 +425,16 @@ class MainWindow(QMainWindow):
         with self._gv_lock:
             self._gv_latest_raw = (float(ts), int(ts_ns), float(x_f), float(y_f))
 
-    def _tick_send_gaze(self):
-        if not self.tracking_active: return
+    def _send_latest_gaze_visual(self):
+        if not self.tracking_active:
+            return
         chk = getattr(self, "visualize", None)
-        if not (chk and chk.isChecked()): return
-        if not (self.tcp_thread and self.tcp_thread.conn): return
-        if "ridge_biquadratic" not in self.models: return
+        if not (chk and chk.isChecked()):
+            return
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            return
+        if "ridge_biquadratic" not in self.models:
+            return
 
         with self._gv_lock:
             latest = self._gv_latest_raw
@@ -415,6 +447,17 @@ class MainWindow(QMainWindow):
         neon_xy_n = normalize_neon_xy(neon_xy_f, CANVAS_W, CANVAS_H)
         xy = predict_ridge_biquad(self.models["ridge_biquadratic"], neon_xy_n)[0]
         self.tcp_thread.send_gaze_visual(ts, float(xy[0]), float(xy[1]), ts_ns=ts_ns)
+
+    def _start_gaze_tx(self):
+        self._stop_gaze_tx()
+        self._gaze_tx_thread = GazeTxThread(self, rate_hz=self.gv_rate_hz)
+        self._gaze_tx_thread.start()
+
+    def _stop_gaze_tx(self):
+        if self._gaze_tx_thread is not None:
+            self._gaze_tx_thread.stop()
+            self._gaze_tx_thread.join(timeout=1.0)
+            self._gaze_tx_thread = None
 
 
     # ---- Neon ----
@@ -563,15 +606,12 @@ class MainWindow(QMainWindow):
             self.start_gaze_logging()
             self.tracking_active = True
             self.btn_track.setText("Stop")
-
-            interval_ms = max(1, int(round(1000.0 / float(self.gv_rate_hz))))
-            self.gaze_tx_timer.start(interval_ms)
+            self._start_gaze_tx()
         else:
             self.stop_gaze_logging()
             self.tracking_active = False
             self.btn_track.setText("Start Gaze Tracking")
-
-            self.gaze_tx_timer.stop()
+            self._stop_gaze_tx()
             with self._gv_lock:
                 self._gv_latest_raw = None
 
