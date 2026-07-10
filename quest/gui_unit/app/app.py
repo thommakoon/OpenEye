@@ -132,7 +132,7 @@ class SharedState:
             self.eval_logger.join(timeout=1.0)
             self.eval_logger = None
     
-    def append_eval_record(self, ts: float, x_f: float, y_f: float, x_raw: float, y_raw: float):
+    def append_eval_record(self, ts: float, ts_ns: int, x_f: float, y_f: float, x_raw: float, y_raw: float):
         if not (self.eval_active and self.eval_logger):
             return
         neon_xy_f = np.array([[float(x_f), float(y_f)]], dtype=float)
@@ -141,6 +141,7 @@ class SharedState:
             "type": "gazeEval",
             "payload": {
                 "t": float(ts),
+                "t_ns": int(ts_ns),
                 "raw": {"x": float(x_raw), "y": float(y_raw)},
                 "filtered": {"x": float(x_f), "y": float(y_f)},
                 "mapped": self._predict_all(neon_xy_n)
@@ -163,7 +164,7 @@ class SharedState:
             self.tracking_logger.join(timeout=1.0)
             self.tracking_logger = None
 
-    def append_tracking_record(self, ts: float, x_f: float, y_f: float, x_raw: float, y_raw: float):
+    def append_tracking_record(self, ts: float, ts_ns: int, x_f: float, y_f: float, x_raw: float, y_raw: float):
         if not (self.tracking_active and self.tracking_logger):
             return
         neon_xy_f = np.array([[float(x_f), float(y_f)]], dtype=float)
@@ -172,6 +173,7 @@ class SharedState:
             "type": "gazeTrack",
             "payload": {
                 "t": float(ts),
+                "t_ns": int(ts_ns),
                 "raw": {"x": float(x_raw), "y": float(y_raw)},
                 "filtered": {"x": float(x_f), "y": float(y_f)},
                 "mapped": self._predict_all(neon_xy_n)
@@ -202,14 +204,16 @@ class GazeCollector(threading.Thread):
             datum = self.device.receive_gaze_datum()
             x, y = datum.x, datum.y
             ts = datum.timestamp_unix_seconds
+            # Integer ns for matching Neon gaze.csv (Realtime API only exposes float seconds).
+            ts_ns = int(getattr(datum, "timestamp_unix_ns", int(ts * 1e9)))
 
             x_f, y_f = self.filter.step(x, y)
             self.state.update_latest_filtered_gaze(x_f, y_f)
             if self.on_new_filtered is not None:
-                try: self.on_new_filtered(ts, x_f, y_f, x, y)
+                try: self.on_new_filtered(ts, ts_ns, x_f, y_f, x, y)
                 except Exception: pass
-            self.state.append_eval_record(ts, x_f, y_f, x, y)
-            self.state.append_tracking_record(ts, x_f, y_f, x, y)
+            self.state.append_eval_record(ts, ts_ns, x_f, y_f, x, y)
+            self.state.append_tracking_record(ts, ts_ns, x_f, y_f, x, y)
             if self.state.recording:
                 self.state.add_datum(datum)
                 event = self.state.consume_event()
@@ -389,9 +393,9 @@ class MainWindow(QMainWindow):
         self.calib_dir = os.path.join(self.participant_dir, "calibration")
         os.makedirs(self.calib_dir, exist_ok=True)
     
-    def stream_gaze_visual(self, ts: float, x_f: float, y_f: float, x_raw: float = 0.0, y_raw: float = 0.0):
+    def stream_gaze_visual(self, ts: float, ts_ns: int, x_f: float, y_f: float, x_raw: float = 0.0, y_raw: float = 0.0):
         with self._gv_lock:
-            self._gv_latest_raw = (float(ts), float(x_f), float(y_f))
+            self._gv_latest_raw = (float(ts), int(ts_ns), float(x_f), float(y_f))
 
     def _tick_send_gaze(self):
         if not self.tracking_active: return
@@ -405,12 +409,12 @@ class MainWindow(QMainWindow):
         if latest is None:
             return
 
-        ts, x_f, y_f = latest
+        ts, ts_ns, x_f, y_f = latest
 
         neon_xy_f = np.array([[float(x_f), float(y_f)]], dtype=float)
         neon_xy_n = normalize_neon_xy(neon_xy_f, CANVAS_W, CANVAS_H)
         xy = predict_ridge_biquad(self.models["ridge_biquadratic"], neon_xy_n)[0]
-        self.tcp_thread.send_gaze_visual(ts, float(xy[0]), float(xy[1]))
+        self.tcp_thread.send_gaze_visual(ts, float(xy[0]), float(xy[1]), ts_ns=ts_ns)
 
 
     # ---- Neon ----

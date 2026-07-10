@@ -55,12 +55,15 @@ class TcpServer(threading.Thread):
             },
         })
     
-    def send_gaze_visual(self, ts: float, x: float, y: float):
+    def send_gaze_visual(self, ts: float, x: float, y: float, ts_ns: int | None = None):
+        payload = {"t": float(ts), "x": float(x), "y": float(y)}
+        if ts_ns is not None:
+            payload["t_ns"] = int(ts_ns)
         self._send({
             "type": "gazeVisual",
-            "payload": {"t": ts, "x": float(x), "y": float(y)}
+            "payload": payload,
         })
-        print(ts, x, y)
+        print(payload.get("t_ns", ts), x, y)
 
     def close(self):
         try:
