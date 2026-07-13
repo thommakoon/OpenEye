@@ -4,6 +4,8 @@ import os
 import threading
 import time
 import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -26,6 +28,7 @@ from ..core.config import DEFAULT_CONFIG as CFG
 from ..core.networking import TcpServer, EvalPlanStreamer
 from ..core.filter import ButterLPFilter
 from ..core.logger import JsonLogger
+from ..core.sync_offset import compute_sync_from_pulses, write_sync_json
 from ..core.mapping import (
     normalize_neon_xy,
     map_biquadratic, map_ridge_biquadratic,
@@ -321,6 +324,8 @@ class MainWindow(QMainWindow):
         self._gaze_tx_thread: Optional[GazeTxThread] = None
         self._sync_pulse_logger: Optional[JsonLogger] = None
         self.sync_pulses_path = None
+        self.sync_json_path = None
+        self._sync_pulse_batch: List[dict] = []
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -568,16 +573,21 @@ class MainWindow(QMainWindow):
                 self._remote_next_step.emit()
 
     def _on_sync_pulse_record(self, record: dict):
+        # Prefer Companion HTTP /api/event so we do NOT call device.send_event
+        # (asyncio.run) while GazeCollector is using the same Device — that race
+        # can stall gaze streaming and corrupt later calibrations.
         if self.device:
             try:
-                ev = self.device.send_event("quest_sync", int(record["pc_recv_unix_ns"]))
-                record["neon_event_name"] = ev.name
-                record["neon_event_ns"] = int(ev.timestamp)
+                neon_ns = self._neon_companion_send_event(
+                    "quest_sync", int(record["pc_recv_unix_ns"])
+                )
+                record["neon_event_name"] = "quest_sync"
+                record["neon_event_ns"] = int(neon_ns)
                 record["neon_event_ok"] = True
             except Exception as e:
                 record["neon_event_ok"] = False
                 record["neon_event_error"] = str(e)
-                print(f"[syncPulse] send_event failed: {e}")
+                print(f"[syncPulse] companion event failed: {e}")
         else:
             record["neon_event_ok"] = False
             record["neon_event_error"] = "neon_not_connected"
@@ -588,6 +598,58 @@ class MainWindow(QMainWindow):
         print(
             f"[syncPulse] seq={record['seq']} quest_ms={record['quest_sent_unix_ms']} "
             f"pc_ms={record['pc_recv_unix_ms']} neon_ns={record.get('neon_event_ns')}"
+        )
+
+        if record.get("neon_event_ok"):
+            self._sync_pulse_batch.append(record)
+            if record.get("seq") == 2:
+                self._finalize_sync_json()
+
+    def _neon_companion_send_event(self, name: str, timestamp_ns: int) -> int:
+        """POST /api/event on Neon Companion (phone). Avoids Device.send_event races."""
+        phone_ip = getattr(self.device, "phone_ip", None)
+        if not phone_ip:
+            raise RuntimeError("device.phone_ip unavailable")
+        url = f"http://{phone_ip}:8080/api/event"
+        body = json.dumps(
+            {"name": str(name), "timestamp": int(timestamp_ns)},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            raise RuntimeError(f"HTTP {e.code}: {detail or e.reason}") from e
+        if raw.strip():
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, dict) and payload.get("timestamp") is not None:
+                    return int(payload["timestamp"])
+            except Exception:
+                pass
+        return int(timestamp_ns)
+
+    def _finalize_sync_json(self):
+        payload = compute_sync_from_pulses(self._sync_pulse_batch)
+        self._sync_pulse_batch.clear()
+        if payload is None:
+            print("[syncPulse] no valid neon pairs; sync.json not written")
+            return
+        self.ensure_dirs()
+        self.sync_json_path = os.path.join(self.participant_dir, "sync.json")
+        write_sync_json(self.sync_json_path, payload)
+        print(
+            f"[syncPulse] sync.json offset_quest_to_phone_ns="
+            f"{payload['offset_quest_to_phone_ns']} "
+            f"spread_std_ns={payload['offset_spread_std_ns']} "
+            f"pulses={payload['pulse_count']}"
         )
 
     # ---- Evaluation ----
@@ -686,7 +748,7 @@ class MainWindow(QMainWindow):
                 "until you press 'Start Gaze Tracking' (with Visualize) here after it connects."
             )
 
-        self.tcp_thread.send_launch_app()
+        self.tcp_thread.send_launch_app("com.PracticeMG.MRstressPRACTICE")
         self.step_label.setText("Step: launching study app on Quest (gaze streaming stays on)...")
 
     def on_recalibrate(self):
