@@ -29,6 +29,7 @@ from ..core.networking import TcpServer, EvalPlanStreamer
 from ..core.filter import ButterLPFilter
 from ..core.logger import JsonLogger
 from ..core.sync_offset import compute_sync_from_pulses, write_sync_json
+from ..core.time_echo_monitor import QuestTimeEchoMonitor
 from ..core.mapping import (
     normalize_neon_xy,
     map_biquadratic, map_ridge_biquadratic,
@@ -300,6 +301,7 @@ class MainWindow(QMainWindow):
     _tcp_status_changed = Signal(str)
     _remote_next_step = Signal()
     _sync_pulse_record = Signal(dict)
+    _sync_status_changed = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -326,6 +328,7 @@ class MainWindow(QMainWindow):
         self.sync_pulses_path = None
         self.sync_json_path = None
         self._sync_pulse_batch: List[dict] = []
+        self._time_echo_monitor: Optional[QuestTimeEchoMonitor] = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -373,7 +376,20 @@ class MainWindow(QMainWindow):
         study_layout.addWidget(self.btn_recalibrate)
         study_layout.addWidget(self.study_hint, stretch=1)
 
-        root.addWidget(ctrl_box); root.addWidget(calib_box); root.addWidget(self.canvas); root.addWidget(task_box); root.addWidget(study_box)
+        sync_box = QGroupBox("Clock sync (PC hub — Neon-style time-echo)")
+        sync_layout = QHBoxLayout(sync_box)
+        self.btn_time_echo = QPushButton("Start Quest↔PC time-echo")
+        self.sync_period_spin = QSpinBox()
+        self.sync_period_spin.setRange(1, 60)
+        self.sync_period_spin.setValue(1)
+        self.sync_period_spin.setSuffix(" s")
+        self.sync_status = QLabel("Sync: idle")
+        sync_layout.addWidget(self.btn_time_echo)
+        sync_layout.addWidget(QLabel("period"))
+        sync_layout.addWidget(self.sync_period_spin)
+        sync_layout.addWidget(self.sync_status, stretch=1)
+
+        root.addWidget(ctrl_box); root.addWidget(calib_box); root.addWidget(self.canvas); root.addWidget(task_box); root.addWidget(study_box); root.addWidget(sync_box)
 
         # wiring
         self.btn_connect_neon.clicked.connect(self.on_connect_neon)
@@ -384,6 +400,8 @@ class MainWindow(QMainWindow):
         self._tcp_status_changed.connect(self._apply_tcp_status)
         self._remote_next_step.connect(self.trigger_step)
         self._sync_pulse_record.connect(self._on_sync_pulse_record)
+        self._sync_status_changed.connect(self._apply_sync_status)
+        self.btn_time_echo.clicked.connect(self.on_toggle_time_echo)
         self.btn_eval.clicked.connect(self.on_toggle_evaluation)
         self.btn_track.clicked.connect(self.on_toggle_gaze_tracking)
         self.btn_launch_study.clicked.connect(self.on_launch_study)
@@ -415,8 +433,14 @@ class MainWindow(QMainWindow):
     def _apply_tcp_status(self, msg: str):
         self.tcp_status.setText(f"TCP: {msg}")
 
+    def _apply_sync_status(self, msg: str):
+        self.sync_status.setText(f"Sync: {msg}")
+
     def status_tcp(self, msg):
         self._tcp_status_changed.emit(msg)
+
+    def status_sync(self, msg: str):
+        self._sync_status_changed.emit(msg)
 
     def repaint_canvas(self):
         with self.state.lock:
@@ -552,6 +576,60 @@ class MainWindow(QMainWindow):
             return
         self.tcp_thread = TcpServer(self.status_tcp, message_cb=self.on_tcp_message)
         self.tcp_thread.start()
+
+    def _neon_time_offset_estimate(self) -> Optional[Dict]:
+        """Pupil Time Echo: phone→PC offset (same formula as Quest leg)."""
+        if not self.device:
+            return None
+        try:
+            est = self.device.estimate_time_offset(
+                number_of_measurements=20,
+                sleep_between_measurements_seconds=None,
+            )
+        except Exception as e:
+            print(f"[timeEcho] neon estimate error: {e}")
+            return None
+        if est is None:
+            return None
+        return {
+            "offset_phone_to_pc_ns": int(round(est.time_offset_ms.mean * 1_000_000)),
+            "phone_offset_ms_mean": float(est.time_offset_ms.mean),
+            "phone_offset_ms_std": float(est.time_offset_ms.std),
+            "phone_rtt_ms_mean": float(est.roundtrip_duration_ms.mean),
+        }
+
+    def on_toggle_time_echo(self):
+        if self._time_echo_monitor and self._time_echo_monitor.is_alive():
+            self._time_echo_monitor.stop()
+            self._time_echo_monitor.join(timeout=2.0)
+            self._time_echo_monitor = None
+            self.btn_time_echo.setText("Start Quest↔PC time-echo")
+            self.status_sync("stopped")
+            return
+
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            QMessageBox.information(
+                self,
+                "Time echo",
+                "Start TCP and connect PracticeTask on Quest first.",
+            )
+            return
+
+        self.ensure_dirs()
+        period_s = float(self.sync_period_spin.value())
+        self._time_echo_monitor = QuestTimeEchoMonitor(
+            self.tcp_thread,
+            participant_dir_fn=lambda: self.participant_dir,
+            period_s=period_s,
+            burst_n=100,
+            rolling_n=100,
+            neon_estimate_fn=self._neon_time_offset_estimate,
+            neon_every_n_periods=max(5, int(10 / max(period_s, 0.5))),
+            status_cb=self.status_sync,
+        )
+        self._time_echo_monitor.start()
+        self.btn_time_echo.setText("Stop Quest↔PC time-echo")
+        self.status_sync(f"running (period={period_s:.0f}s)")
 
     def on_tcp_message(self, msg: dict):
         # Runs on the TCP thread; marshal to GUI thread via signals.
@@ -995,6 +1073,13 @@ class MainWindow(QMainWindow):
     # ---- Cleanup ----
     def cleanup_and_close(self):
         self.state.running = False
+        try:
+            if self._time_echo_monitor and self._time_echo_monitor.is_alive():
+                self._time_echo_monitor.stop()
+                self._time_echo_monitor.join(timeout=2.0)
+                self._time_echo_monitor = None
+        except Exception:
+            pass
         time.sleep(0.1)
         try:
             if self.device:

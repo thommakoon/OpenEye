@@ -3,9 +3,14 @@ import json
 import socket
 import threading
 import time
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 HOST, PORT = "0.0.0.0", 5051
+
+
+def _time_ms() -> int:
+    return time.time_ns() // 1_000_000
+
 
 class TcpServer(threading.Thread):
     def __init__(self, status_cb, message_cb=None):
@@ -17,6 +22,11 @@ class TcpServer(threading.Thread):
         self.addr: Optional[Tuple[str, int]] = None
         self._stop = False
         self._send_lock = threading.Lock()
+        # Neon-style time-echo request/response (see request_time_echo).
+        self._echo_lock = threading.Lock()
+        self._echo_event = threading.Event()
+        self._echo_expect_t1: Optional[int] = None
+        self._echo_result: Optional[dict[str, Any]] = None
 
     def run(self):
         try:
@@ -86,6 +96,30 @@ class TcpServer(threading.Thread):
             except Exception as e:
                 print(f"[TCP] parse error: {e}")
                 continue
+
+            # Handle timeEcho replies locally (request_time_echo waiter).
+            if isinstance(msg, dict) and msg.get("type") == "timeEcho":
+                t2 = _time_ms()
+                pl = msg.get("payload") or {}
+                t1 = pl.get("pc_t1_ms")
+                tH = pl.get("quest_tH_ms")
+                with self._echo_lock:
+                    if (
+                        self._echo_expect_t1 is not None
+                        and t1 is not None
+                        and int(t1) == int(self._echo_expect_t1)
+                        and tH is not None
+                    ):
+                        self._echo_result = {
+                            "pc_t1_ms": int(t1),
+                            "pc_t2_ms": int(t2),
+                            "quest_tH_ms": int(tH),
+                            "rtt_ms": int(t2) - int(t1),
+                            "offset_ms": ((int(t1) + int(t2)) / 2.0) - float(tH),
+                        }
+                        self._echo_event.set()
+                continue
+
             if self.message_cb is not None:
                 try:
                     self.message_cb(msg)
@@ -134,8 +168,39 @@ class TcpServer(threading.Thread):
         # High-rate path: skip console I/O (was a major cost at 30–100 Hz).
         self._send({"type": "gazeVisual", "payload": payload}, quiet=True)
 
+    def request_time_echo(self, timeout_s: float = 1.0) -> Optional[dict[str, Any]]:
+        """Neon-style round-trip: PC t1 → Quest replies (t1, tH) → PC t2.
+
+        Returns dict with pc_t1_ms, pc_t2_ms, quest_tH_ms, rtt_ms, offset_ms
+        where offset_ms = ((t1+t2)/2) - tH  (pc_ms = quest_ms + offset_ms).
+        """
+        if not self.conn:
+            return None
+        with self._echo_lock:
+            self._echo_event.clear()
+            self._echo_result = None
+            t1 = _time_ms()
+            self._echo_expect_t1 = t1
+        self._send(
+            {"type": "timeEcho", "payload": {"pc_t1_ms": int(t1), "quest_tH_ms": 0}},
+            quiet=True,
+        )
+        if not self._echo_event.wait(timeout_s):
+            with self._echo_lock:
+                self._echo_expect_t1 = None
+            return None
+        with self._echo_lock:
+            result = self._echo_result
+            self._echo_expect_t1 = None
+            self._echo_result = None
+        return result
+
     def close(self):
         self._stop = True
+        try:
+            self._echo_event.set()
+        except Exception:
+            pass
         try:
             if self.conn:
                 self.conn.close()
