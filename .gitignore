@@ -79,8 +79,7 @@ Package.resolved
 sysinfo.txt
 
 # Local session exports / gaze logs (do not commit)
-t00/
-t01/
+t[0-9][0-9]/
 
 # Visual Studio
 quest/processing_unit/.vs/

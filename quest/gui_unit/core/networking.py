@@ -38,8 +38,8 @@ class TcpServer(threading.Thread):
             self.status_cb(f"TCP error: {e}")
             return
 
-        # Accept loop: keep serving new clients (e.g. after OpenEye hands off
-        # to PracticeTask, PracticeTask connects as a fresh client).
+            # Accept loop: keep serving new clients (e.g. after OpenEye hands off
+            # to MainStudy, MainStudy connects as a fresh client).
         while not self._stop:
             self.status_cb(f"Waiting...{HOST}:{PORT}")
             try:
@@ -167,6 +167,30 @@ class TcpServer(threading.Thread):
             payload["t_ns"] = int(ts_ns)
         # High-rate path: skip console I/O (was a major cost at 30–100 Hz).
         self._send({"type": "gazeVisual", "payload": payload}, quiet=True)
+
+    def send_main_study_start(
+        self,
+        *,
+        sub_num: int,
+        subsub_num: int,
+        condition: str,
+        reps: int = 3,
+        duration_sec: int = 300,
+    ):
+        """Command MainStudy Quest app: run one condition then return to IDLE.
+
+        Each Fitts rep lasts ``duration_sec`` (timed loop), default 300 (5 min).
+        """
+        self._send({
+            "type": "mainStudyStart",
+            "payload": {
+                "sub_num": int(sub_num),
+                "subsub_num": int(subsub_num),
+                "condition": str(condition),
+                "reps": int(reps),
+                "duration_sec": int(duration_sec),
+            },
+        })
 
     def request_time_echo(self, timeout_s: float = 1.0) -> Optional[dict[str, Any]]:
         """Neon-style round-trip: PC t1 → Quest replies (t1, tH) → PC t2.

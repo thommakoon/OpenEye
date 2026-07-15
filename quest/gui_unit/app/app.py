@@ -16,7 +16,7 @@ from PySide6.QtCore import Qt, QTimer, QPointF, Signal
 from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QCheckBox, QSpinBox, QGroupBox, QMessageBox
+    QLabel, QPushButton, QCheckBox, QSpinBox, QComboBox, QGroupBox, QMessageBox
 )
 # ---- Pupil Labs Real-Time API ----
 from pupil_labs.realtime_api.simple import discover_one_device
@@ -302,6 +302,7 @@ class MainWindow(QMainWindow):
     _remote_next_step = Signal()
     _sync_pulse_record = Signal(dict)
     _sync_status_changed = Signal(str)
+    _main_study_done = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -367,14 +368,35 @@ class MainWindow(QMainWindow):
         task_layout.addWidget(self.btn_eval); task_layout.addWidget(self.btn_track); task_layout.addWidget(self.visualize)
 
         study_box = QGroupBox("Study Handoff"); study_layout = QHBoxLayout(study_box)
-        self.btn_launch_study = QPushButton("Start Study (Open Fitts App on Quest)")
-        self.btn_recalibrate = QPushButton("Recalibrate (Open OpenEye on Quest)")
+        self.btn_launch_practice = QPushButton("Start Practice")
+        self.btn_launch_study = QPushButton("Start Main Study")
+        self.btn_recalibrate = QPushButton("Recalibrate (OpenEye)")
         self.study_hint = QLabel(
-            "Start Study: OpenEye → PracticeTask.  Recalibrate: PracticeTask → OpenEye."
+            "Practice = auto Fitts. Main Study = PC-commanded. Recalibrate → OpenEye calib."
         )
+        study_layout.addWidget(self.btn_launch_practice)
         study_layout.addWidget(self.btn_launch_study)
         study_layout.addWidget(self.btn_recalibrate)
         study_layout.addWidget(self.study_hint, stretch=1)
+
+        main_box = QGroupBox("Main Study commander (MRstress IDLE)")
+        main_layout = QHBoxLayout(main_box)
+        self.ms_sub = QSpinBox(); self.ms_sub.setRange(0, 999); self.ms_sub.setValue(0)
+        self.ms_subsub = QSpinBox(); self.ms_subsub.setRange(0, 9); self.ms_subsub.setValue(0)
+        self.ms_condition = QComboBox()
+        self.ms_condition.addItems(["EyeDwell", "EyePinch", "HeadDwell", "HeadPinch"])
+        self.ms_reps = QSpinBox(); self.ms_reps.setRange(1, 10); self.ms_reps.setValue(3)
+        self.ms_duration_min = QSpinBox(); self.ms_duration_min.setRange(1, 30); self.ms_duration_min.setValue(5)
+        self.ms_duration_min.setSuffix(" min")
+        self.btn_ms_start = QPushButton("Start condition")
+        self.ms_status = QLabel("Status: idle (Quest MainStudy must be connected)")
+        main_layout.addWidget(QLabel("sub")); main_layout.addWidget(self.ms_sub)
+        main_layout.addWidget(QLabel("subsub")); main_layout.addWidget(self.ms_subsub)
+        main_layout.addWidget(QLabel("condition")); main_layout.addWidget(self.ms_condition)
+        main_layout.addWidget(QLabel("reps")); main_layout.addWidget(self.ms_reps)
+        main_layout.addWidget(QLabel("each")); main_layout.addWidget(self.ms_duration_min)
+        main_layout.addWidget(self.btn_ms_start)
+        main_layout.addWidget(self.ms_status, stretch=1)
 
         sync_box = QGroupBox("Clock sync (PC hub — Neon-style time-echo)")
         sync_layout = QHBoxLayout(sync_box)
@@ -389,7 +411,8 @@ class MainWindow(QMainWindow):
         sync_layout.addWidget(self.sync_period_spin)
         sync_layout.addWidget(self.sync_status, stretch=1)
 
-        root.addWidget(ctrl_box); root.addWidget(calib_box); root.addWidget(self.canvas); root.addWidget(task_box); root.addWidget(study_box); root.addWidget(sync_box)
+        root.addWidget(ctrl_box); root.addWidget(calib_box); root.addWidget(self.canvas)
+        root.addWidget(task_box); root.addWidget(study_box); root.addWidget(main_box); root.addWidget(sync_box)
 
         # wiring
         self.btn_connect_neon.clicked.connect(self.on_connect_neon)
@@ -401,11 +424,15 @@ class MainWindow(QMainWindow):
         self._remote_next_step.connect(self.trigger_step)
         self._sync_pulse_record.connect(self._on_sync_pulse_record)
         self._sync_status_changed.connect(self._apply_sync_status)
+        self._main_study_done.connect(self._on_main_study_done)
         self.btn_time_echo.clicked.connect(self.on_toggle_time_echo)
         self.btn_eval.clicked.connect(self.on_toggle_evaluation)
         self.btn_track.clicked.connect(self.on_toggle_gaze_tracking)
+        self.btn_launch_practice.clicked.connect(self.on_launch_practice)
         self.btn_launch_study.clicked.connect(self.on_launch_study)
+        self.btn_ms_start.clicked.connect(self.on_main_study_start)
         self.btn_recalibrate.clicked.connect(self.on_recalibrate)
+        self._ms_running = False
 
         # UI update timer
         self.timer = QTimer(self); self.timer.timeout.connect(self.repaint_canvas); self.timer.start(5)
@@ -599,19 +626,27 @@ class MainWindow(QMainWindow):
         }
 
     def on_toggle_time_echo(self):
-        if self._time_echo_monitor and self._time_echo_monitor.is_alive():
-            self._time_echo_monitor.stop()
-            self._time_echo_monitor.join(timeout=2.0)
+        mon = self._time_echo_monitor
+        if mon is not None:
+            try:
+                alive = mon.is_alive()
+            except TypeError:
+                # Old bug: monitor named Event `_stop` and broke Thread.is_alive().
+                alive = False
+            if alive:
+                mon.stop()
+                mon.join(timeout=2.0)
+                self._time_echo_monitor = None
+                self.btn_time_echo.setText("Start Quest↔PC time-echo")
+                self.status_sync("stopped")
+                return
             self._time_echo_monitor = None
-            self.btn_time_echo.setText("Start Quest↔PC time-echo")
-            self.status_sync("stopped")
-            return
 
         if not (self.tcp_thread and self.tcp_thread.conn):
             QMessageBox.information(
                 self,
                 "Time echo",
-                "Start TCP and connect PracticeTask on Quest first.",
+                "Start TCP and connect MainStudy on Quest first.",
             )
             return
 
@@ -649,6 +684,24 @@ class MainWindow(QMainWindow):
             # Only honor pinch during active calibration; ignore stray pinches.
             if self.state.recording and not self.state.ended:
                 self._remote_next_step.emit()
+            return
+        if mtype == "mainStudyDone":
+            payload = msg.get("payload") or {}
+            self._main_study_done.emit(dict(payload))
+
+    def _on_main_study_done(self, payload: dict):
+        self._ms_running = False
+        cond = payload.get("condition", "?")
+        ok = payload.get("ok", True)
+        sub = payload.get("sub_num", "?")
+        subsub = payload.get("subsub_num", "?")
+        reps = payload.get("reps", "?")
+        state = "done" if ok else "failed"
+        self.ms_status.setText(
+            f"Status: {state} — sub {sub}-{subsub} {cond} ×{reps}; IDLE again"
+        )
+        self.btn_ms_start.setEnabled(True)
+        print(f"[mainStudyDone] {payload}")
 
     def _on_sync_pulse_record(self, record: dict):
         # Prefer Companion HTTP /api/event so we do NOT call device.send_event
@@ -801,46 +854,122 @@ class MainWindow(QMainWindow):
                 self._gv_latest_raw = None
 
     # ---- Study handoff ----
-    def on_launch_study(self):
+    def on_launch_practice(self):
         if not (self.tcp_thread and self.tcp_thread.conn):
-            QMessageBox.information(self, "Start Study", "Start the TCP server and connect the Quest app first.")
+            QMessageBox.information(
+                self, "Start Practice",
+                "Start the TCP server and connect the Quest app first.",
+            )
             return
 
         confirm = QMessageBox.question(
-            self, "Start Study",
-            "Launch the Fitts study app on the Quest and close OpenEye there?\n"
-            "Make sure calibration looks good first.",
+            self, "Start Practice",
+            "Launch PracticeTask (auto Fitts) on the Quest?\n"
+            "Package: com.PracticeMG.MRstressPRACTICE",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        if self.eval_active:
+            self.on_toggle_evaluation()
+
+        self.tcp_thread.send_launch_app("com.PracticeMG.MRstressPRACTICE")
+        self.step_label.setText("Step: launching PracticeTask on Quest...")
+
+    def on_launch_study(self):
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            QMessageBox.information(self, "Start Main Study", "Start the TCP server and connect the Quest app first.")
+            return
+
+        confirm = QMessageBox.question(
+            self, "Start Main Study",
+            "Launch MainStudy (PC-commanded) on the Quest and close OpenEye there?\n"
+            "Make sure calibration looks good first.\n"
+            "Package: com.PracticeMG.MRstress",
         )
         if confirm != QMessageBox.Yes:
             return
 
         # Stop the calibration-eval saccade stream, but KEEP gaze tracking running:
-        # after PracticeTask reconnects, the PC auto-resumes streaming gazeVisual to it.
+        # after MainStudy reconnects, the PC auto-resumes streaming gazeVisual to it.
         if self.eval_active:
             self.on_toggle_evaluation()
 
         if not self.tracking_active:
             QMessageBox.information(
-                self, "Start Study",
-                "Note: Gaze Tracking is OFF. Eye blocks in PracticeTask will have no gaze "
+                self, "Start Main Study",
+                "Note: Gaze Tracking is OFF. Eye blocks in MainStudy will have no gaze "
                 "until you press 'Start Gaze Tracking' (with Visualize) here after it connects."
             )
 
-        self.tcp_thread.send_launch_app("com.PracticeMG.MRstressPRACTICE")
-        self.step_label.setText("Step: launching study app on Quest (gaze streaming stays on)...")
+        self.tcp_thread.send_launch_app("com.PracticeMG.MRstress")
+        self.ms_status.setText("Status: launching MainStudy — wait for Quest IDLE")
+        self.step_label.setText("Step: launching MainStudy on Quest (gaze streaming stays on)...")
+
+    def on_main_study_start(self):
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            QMessageBox.information(
+                self, "Main Study",
+                "Quest MainStudy must be connected on TCP first (IDLE screen).",
+            )
+            return
+        if self._ms_running:
+            QMessageBox.information(
+                self, "Main Study",
+                "A condition is already running. Wait for mainStudyDone (or restart Quest).",
+            )
+            return
+
+        condition = self.ms_condition.currentText()
+        sub_num = int(self.ms_sub.value())
+        subsub_num = int(self.ms_subsub.value())
+        reps = int(self.ms_reps.value())
+        duration_sec = int(self.ms_duration_min.value()) * 60
+
+        confirm = QMessageBox.question(
+            self, "Start condition",
+            f"Start on Quest?\n\n"
+            f"Participant {sub_num}-{subsub_num}\n"
+            f"Condition: {condition}\n"
+            f"Fitts reps: {reps}\n"
+            f"Each rep duration: {duration_sec // 60} min ({duration_sec}s)\n\n"
+            f"Quest returns to IDLE when finished.",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        if not self.tracking_active and condition.startswith("Eye"):
+            QMessageBox.information(
+                self, "Main Study",
+                "Gaze Tracking is OFF. Turn it on (and Visualize) for eye conditions.",
+            )
+
+        self.tcp_thread.send_main_study_start(
+            sub_num=sub_num,
+            subsub_num=subsub_num,
+            condition=condition,
+            reps=reps,
+            duration_sec=duration_sec,
+        )
+        self._ms_running = True
+        self.btn_ms_start.setEnabled(False)
+        self.ms_status.setText(
+            f"Status: running {condition} ×{reps} ({duration_sec // 60} min each) "
+            f"for {sub_num}-{subsub_num}…"
+        )
 
     def on_recalibrate(self):
         if not (self.tcp_thread and self.tcp_thread.conn):
             QMessageBox.information(
                 self, "Recalibrate",
-                "Start the TCP server and connect PracticeTask on the Quest first.",
+                "Start the TCP server and connect MainStudy on the Quest first.",
             )
             return
 
         confirm = QMessageBox.question(
             self, "Recalibrate",
-            "Launch the OpenEye calibration app on the Quest and close PracticeTask?\n"
-            "After calibration, use Start Study to return to the Fitts app.",
+            "Launch the OpenEye calibration app on the Quest and close MainStudy?\n"
+            "After calibration, use Start Study to return to MainStudy.",
         )
         if confirm != QMessageBox.Yes:
             return

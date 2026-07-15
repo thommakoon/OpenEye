@@ -12,19 +12,21 @@ using UnityEngine.SceneManagement;
 [Serializable] public class PayloadGaze { public double t; public float x; public float y; }
 
 [Serializable] public class PayloadLaunch { public string package; }
+[Serializable] public class PayloadTimeEcho { public long pc_t1_ms; public long quest_tH_ms; }
 
 [Serializable] class MsgTypeOnly { public string type; }
 [Serializable] class MsgUpdateStep { public string type; public PayloadStep payload; }
 [Serializable] class MsgEvalTarget { public string type; public PayloadEval payload; }
 [Serializable] class MsgGaze { public string type; public PayloadGaze payload; }
 [Serializable] class MsgLaunch { public string type; public PayloadLaunch payload; }
+[Serializable] class MsgTimeEcho { public string type; public PayloadTimeEcho payload; }
 
 public class TCPClient : MonoBehaviour
 {
     public static TCPClient Instance;
 
     [Header("Server")]
-    public string serverIp = "XXX.XXX.XXX.XXX"; // Enter your IP address
+    public string serverIp = "192.168.0.3"; // Enter your IP address
     public int serverPort = 5051;
 
     [Header("Auto Connect / Reconnect")]
@@ -228,6 +230,19 @@ public class TCPClient : MonoBehaviour
                             break;
                         }
 
+                        case "timeEcho":
+                        {
+                            // Neon-style round-trip: reply ASAP with pc_t1 + Quest host time.
+                            var echo = JsonUtility.FromJson<MsgTimeEcho>(json);
+                            long t1 = echo?.payload != null ? echo.payload.pc_t1_ms : 0L;
+                            long tH = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                            string reply =
+                                "{\"type\":\"timeEcho\",\"payload\":{\"pc_t1_ms\":" + t1 +
+                                ",\"quest_tH_ms\":" + tH + "}}";
+                            SendRawJson(reply);
+                            break;
+                        }
+
                         case "evalTarget":
                         {
                             var msg = JsonUtility.FromJson<MsgEvalTarget>(json);
@@ -291,13 +306,17 @@ public class TCPClient : MonoBehaviour
     /// </summary>
     public bool SendControl(string type)
     {
+        return SendRawJson("{\"type\":\"" + type + "\",\"payload\":{}}");
+    }
+
+    bool SendRawJson(string json)
+    {
         var stream = _stream;
         if (stream == null || CurrentState != State.Connected)
             return false;
 
         try
         {
-            string json = "{\"type\":\"" + type + "\",\"payload\":{}}";
             byte[] payload = Encoding.UTF8.GetBytes(json);
             int len = payload.Length;
             byte[] header = new byte[4]
@@ -317,7 +336,7 @@ public class TCPClient : MonoBehaviour
         }
         catch (Exception e)
         {
-            Debug.LogWarning($"[TCP] SendControl failed: {e.Message}");
+            Debug.LogWarning($"[TCP] send failed: {e.Message}");
             return false;
         }
     }

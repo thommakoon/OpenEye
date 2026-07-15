@@ -42,14 +42,16 @@ class QuestTimeEchoMonitor(threading.Thread):
         self.neon_every_n_periods = max(1, int(neon_every_n_periods))
         self.status_cb = status_cb
         self.sync_written_cb = sync_written_cb
-        self._stop = threading.Event()
+        # Must not be named `_stop` — that shadows threading.Thread._stop and
+        # breaks is_alive() after the worker exits.
+        self._halt = threading.Event()
         self._samples: list[dict[str, Any]] = []
         self._phone_offset_ns: Optional[int] = None
         self._phone_meta: dict[str, Any] = {}
         self._lock = threading.Lock()
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
     def _status(self, msg: str):
         if self.status_cb:
@@ -61,11 +63,18 @@ class QuestTimeEchoMonitor(threading.Thread):
 
     def _collect(self, n: int) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for _ in range(n):
-            if self._stop.is_set():
+        timeouts = 0
+        for i in range(n):
+            if self._halt.is_set():
                 break
             sample = self.tcp.request_time_echo(timeout_s=self.echo_timeout_s)
             if sample is None:
+                timeouts += 1
+                if timeouts == 1 or timeouts == 5 or (timeouts % 25 == 0):
+                    self._status(
+                        f"echo timeout ({timeouts}/{i + 1}) — "
+                        "is MainStudy/OpenEye calib (with timeEcho) TCP-connected?"
+                    )
                 continue
             sample["pc_unix_ns"] = time.time_ns()
             out.append(sample)
@@ -117,7 +126,10 @@ class QuestTimeEchoMonitor(threading.Thread):
         self._status(f"burst×{self.burst_n} then every {self.period_s:.1f}s")
         burst = self._collect(self.burst_n)
         if len(burst) < 3:
-            self._status(f"burst failed ({len(burst)} ok); stopping")
+            self._status(
+                f"burst failed ({len(burst)} ok); no sync.json. "
+                "Redeploy MainStudy (or OpenEye calib) with timeEcho, then connect that app over TCP."
+            )
             return
         # Drop first sample (Warm-up), mirror Pupil TimeOffsetEstimator.
         if len(burst) > 1:
@@ -129,7 +141,7 @@ class QuestTimeEchoMonitor(threading.Thread):
         self._write_sync(samples_snap)
 
         period_i = 0
-        while not self._stop.wait(self.period_s):
+        while not self._halt.wait(self.period_s):
             period_i += 1
             one = self._collect(1)
             if one:
