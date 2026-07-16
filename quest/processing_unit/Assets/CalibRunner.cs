@@ -41,6 +41,14 @@ public class CalibRunner : MonoBehaviour
             tcp.OnEvalTarget    += HandleEvalTarget;
             tcp.OnStateChanged  += HandleState;
         }
+
+        // Practice-style ray overlay (independent of shared calib Dot).
+        if (GetComponent<OpenEyeMappedGazeRay>() == null)
+            gameObject.AddComponent<OpenEyeMappedGazeRay>();
+
+        // PC → Quest app switch (official OpenEye has no handoff).
+        if (tcp != null && tcp.GetComponent<PracticeTaskHandoff>() == null)
+            tcp.gameObject.AddComponent<PracticeTaskHandoff>();
     }
 
     void OnDisable()

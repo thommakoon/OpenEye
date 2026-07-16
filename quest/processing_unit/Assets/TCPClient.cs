@@ -26,7 +26,7 @@ public class TCPClient : MonoBehaviour
     public static TCPClient Instance;
 
     [Header("Server")]
-    public string serverIp = "192.168.0.3"; // Enter your IP address
+    public string serverIp = "192.168.0.50"; // Enter your IP address
     public int serverPort = 5051;
 
     [Header("Auto Connect / Reconnect")]
@@ -91,10 +91,12 @@ public class TCPClient : MonoBehaviour
         Instance = this;
         DontDestroyOnLoad(gameObject);
 
+        // Not in official OpenEye; must be present so PC Start Practice / Main Study works.
+        if (GetComponent<PracticeTaskHandoff>() == null)
+            gameObject.AddComponent<PracticeTaskHandoff>();
+
         if (autoConnectOnStart)
             _ = StartConnectLoop();
-            
-        
     }
     void OnDestroy()
     {
@@ -142,11 +144,13 @@ public class TCPClient : MonoBehaviour
         SetState(State.Connecting);
         try
         {
+            // Keep socket buffers small so stare gazeVisual can't sit as a multi-second FIFO.
+            // Practice OpenEyeGazeReceiver uses default buffers + a dedicated sync thread.
             _client = new TcpClient
             {
                 NoDelay = true,
-                ReceiveBufferSize = 1 << 20,
-                SendBufferSize    = 1 << 20
+                ReceiveBufferSize = 64 * 1024,
+                SendBufferSize    = 64 * 1024
             };
 
             var connectTask = _client.ConnectAsync(serverIp, serverPort);
@@ -160,7 +164,14 @@ public class TCPClient : MonoBehaviour
             _stream = _client.GetStream();
             SetState(State.Connected);
 
-            _ = ReceiveLoop(token);
+            // Dedicated thread (not async Task): keeps up with 60–100 Hz gaze without
+            // Unity await scheduling delays that let TCP backlog grow past 1s.
+            _recvThread = new Thread(() => ReceiveLoop(token))
+            {
+                IsBackground = true,
+                Name = "OpenEyeTCPRecv"
+            };
+            _recvThread.Start();
         }
         catch (Exception e)
         {
@@ -169,133 +180,181 @@ public class TCPClient : MonoBehaviour
         }
     }
 
-    async Task ReceiveLoop(CancellationToken token)
+    void ReceiveLoop(CancellationToken token)
     {
         var headerBuf = new byte[4];
+        byte[] payloadBuf = new byte[512];
 
         try
         {
             while (!token.IsCancellationRequested)
             {
-                await ReadExactAsync(_stream, headerBuf, 0, 4, token);
-                int len = (headerBuf[0] << 24) | (headerBuf[1] << 16) | (headerBuf[2] << 8) | headerBuf[3];
-                if (len <= 0 || len > 10_000_000) throw new Exception($"invalid length: {len}");
+                string json = ReadOneFrame(_stream, headerBuf, ref payloadBuf);
+                GazeMsg? latestGaze = null;
+                HandleFrame(json, ref latestGaze);
 
-                // payload
-                byte[] payload = new byte[len];
-                await ReadExactAsync(_stream, payload, 0, len, token);
-                string json = Encoding.UTF8.GetString(payload);
-
-                try
+                // Drain already-buffered frames without waiting: for gazeVisual keep only
+                // the newest sample so a temporary stall cannot become multi-second lag.
+                while (TryPeekCompleteFrameLength(out int nextLen) &&
+                       _client != null &&
+                       _client.Available >= 4 + nextLen)
                 {
-                    var head = JsonUtility.FromJson<MsgTypeOnly>(json);
-                    if (head == null || string.IsNullOrEmpty(head.type))
-                    {
-                        if ((_logCounter++ % logEveryN) == 0)
-                            Debug.LogWarning($"[TCP] unknown json: {json}");
-                        continue;
-                    }
-
-                    switch (head.type)
-                    {
-                        case "updateStep":
-                        {
-                            var msg = JsonUtility.FromJson<MsgUpdateStep>(json);
-                            if (msg?.payload != null)
-                            {
-                                _pendingStep = msg.payload.step;
-                            }
-                            break;
-                        }
-
-                        case "calibrationEnd":
-                        {
-                            _pendingCalibEnd = true;
-                            if (loadSceneOnCalibEnd && !string.IsNullOrEmpty(nextSceneName))
-                                SceneManager.LoadScene(nextSceneName);
-                            break;
-                        }
-
-                        case "resetCalib":
-                        {
-                            _pendingResetCalib = true;
-                            break;
-                        }
-
-                        case "launchApp":
-                        {
-                            var msg = JsonUtility.FromJson<MsgLaunch>(json);
-                            _pendingLaunchPackage = msg?.payload?.package ?? "";
-                            _pendingLaunchApp = true;
-                            break;
-                        }
-
-                        case "timeEcho":
-                        {
-                            // Neon-style round-trip: reply ASAP with pc_t1 + Quest host time.
-                            var echo = JsonUtility.FromJson<MsgTimeEcho>(json);
-                            long t1 = echo?.payload != null ? echo.payload.pc_t1_ms : 0L;
-                            long tH = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                            string reply =
-                                "{\"type\":\"timeEcho\",\"payload\":{\"pc_t1_ms\":" + t1 +
-                                ",\"quest_tH_ms\":" + tH + "}}";
-                            SendRawJson(reply);
-                            break;
-                        }
-
-                        case "evalTarget":
-                        {
-                            var msg = JsonUtility.FromJson<MsgEvalTarget>(json);
-                            if (msg?.payload != null && msg.payload.pos != null)
-                            {
-                                _latestEval = new EvalMsg {
-                                    idx = msg.payload.idx,
-                                    tms = msg.payload.t_ms,
-                                    p_m = new Vector2(msg.payload.pos.x, msg.payload.pos.y) // meters at z=1m
-                                };
-                                _hasLatestEval = true;
-                            }
-                            break;
-                        }
-
-                        case "gazeVisual":
-                        {
-                            var msg = JsonUtility.FromJson<MsgGaze>(json);
-                            if (msg?.payload != null)
-                            {
-                                    EnqueueGaze(new GazeMsg
-                                    {
-                                        t = msg.payload.t,
-                                        p = new Vector2(msg.payload.x, msg.payload.y)
-                                    });
-
-                                    latestGazeX = msg.payload.x;
-                                    latestGazeY = msg.payload.y;
-
-                                // if ((_logCounter++ % logEveryN) == 0)
-                                //     Debug.Log($"[TCP] gaze enq t={msg.payload.t:F3}, x={msg.payload.x:F3}, y={msg.payload.y:F3}");
-                            }
-                            break;
-                        }
-
-                        default:
-                            if ((_logCounter++ % logEveryN) == 0)
-                                Debug.Log($"[TCP] unknown type: {head.type}");
-                            break;
-                    }
+                    json = ReadOneFrame(_stream, headerBuf, ref payloadBuf);
+                    HandleFrame(json, ref latestGaze);
                 }
-                catch (Exception pe)
-                {
-                    Debug.LogWarning($"[TCP] parse error: {pe.Message}\nJSON={json}");
-                }
+
+                if (latestGaze.HasValue)
+                    ApplyGaze(latestGaze.Value);
             }
         }
         catch (Exception e)
         {
-            Debug.LogWarning($"[TCP] recv loop end: {e.Message}");
+            if (!token.IsCancellationRequested)
+                Debug.LogWarning($"[TCP] recv loop end: {e.Message}");
         }
 
         Disconnect();
+    }
+
+    bool TryPeekCompleteFrameLength(out int len)
+    {
+        len = 0;
+        try
+        {
+            if (_client == null || !_client.Connected || _client.Available < 4)
+                return false;
+
+            var peek = new byte[4];
+            int n = _client.Client.Receive(peek, 0, 4, SocketFlags.Peek);
+            if (n < 4)
+                return false;
+
+            len = (peek[0] << 24) | (peek[1] << 16) | (peek[2] << 8) | peek[3];
+            return len > 0 && len <= 10_000_000;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static string ReadOneFrame(NetworkStream stream, byte[] headerBuf, ref byte[] payloadBuf)
+    {
+        ReadExact(stream, headerBuf, 0, 4);
+        int len = (headerBuf[0] << 24) | (headerBuf[1] << 16) | (headerBuf[2] << 8) | headerBuf[3];
+        if (len <= 0 || len > 10_000_000)
+            throw new Exception($"invalid length: {len}");
+
+        if (payloadBuf.Length < len)
+            payloadBuf = new byte[len];
+
+        ReadExact(stream, payloadBuf, 0, len);
+        return Encoding.UTF8.GetString(payloadBuf, 0, len);
+    }
+
+    void HandleFrame(string json, ref GazeMsg? latestGaze)
+    {
+        try
+        {
+            // Fast path: high-rate stream — avoid double JsonUtility when type is obvious.
+            if (json.IndexOf("\"gazeVisual\"", StringComparison.Ordinal) >= 0)
+            {
+                var msg = JsonUtility.FromJson<MsgGaze>(json);
+                if (msg?.payload != null)
+                {
+                    latestGaze = new GazeMsg
+                    {
+                        t = msg.payload.t,
+                        p = new Vector2(msg.payload.x, msg.payload.y)
+                    };
+                }
+                return;
+            }
+
+            var head = JsonUtility.FromJson<MsgTypeOnly>(json);
+            if (head == null || string.IsNullOrEmpty(head.type))
+            {
+                if ((_logCounter++ % logEveryN) == 0)
+                    Debug.LogWarning($"[TCP] unknown json: {json}");
+                return;
+            }
+
+            switch (head.type)
+            {
+                case "updateStep":
+                {
+                    var msg = JsonUtility.FromJson<MsgUpdateStep>(json);
+                    if (msg?.payload != null)
+                        _pendingStep = msg.payload.step;
+                    break;
+                }
+
+                case "calibrationEnd":
+                {
+                    _pendingCalibEnd = true;
+                    if (loadSceneOnCalibEnd && !string.IsNullOrEmpty(nextSceneName))
+                        SceneManager.LoadScene(nextSceneName);
+                    break;
+                }
+
+                case "resetCalib":
+                    _pendingResetCalib = true;
+                    break;
+
+                case "launchApp":
+                {
+                    var msg = JsonUtility.FromJson<MsgLaunch>(json);
+                    _pendingLaunchPackage = msg?.payload?.package ?? "";
+                    _pendingLaunchApp = true;
+                    break;
+                }
+
+                case "timeEcho":
+                {
+                    var echo = JsonUtility.FromJson<MsgTimeEcho>(json);
+                    long t1 = echo?.payload != null ? echo.payload.pc_t1_ms : 0L;
+                    long tH = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    string reply =
+                        "{\"type\":\"timeEcho\",\"payload\":{\"pc_t1_ms\":" + t1 +
+                        ",\"quest_tH_ms\":" + tH + "}}";
+                    SendRawJson(reply);
+                    break;
+                }
+
+                case "evalTarget":
+                {
+                    var msg = JsonUtility.FromJson<MsgEvalTarget>(json);
+                    if (msg?.payload != null && msg.payload.pos != null)
+                    {
+                        _latestEval = new EvalMsg
+                        {
+                            idx = msg.payload.idx,
+                            tms = msg.payload.t_ms,
+                            p_m = new Vector2(msg.payload.pos.x, msg.payload.pos.y)
+                        };
+                        _hasLatestEval = true;
+                    }
+                    break;
+                }
+
+                default:
+                    if ((_logCounter++ % logEveryN) == 0)
+                        Debug.Log($"[TCP] unknown type: {head.type}");
+                    break;
+            }
+        }
+        catch (Exception pe)
+        {
+            Debug.LogWarning($"[TCP] parse error: {pe.Message}\nJSON={json}");
+        }
+    }
+
+    void ApplyGaze(GazeMsg gaze)
+    {
+        EnqueueGaze(gaze);
+        latestGazeX = gaze.p.x;
+        latestGazeY = gaze.p.y;
+        GazeTimestamp = (float)gaze.t;
     }
 
     readonly object _sendLock = new object();
@@ -341,12 +400,12 @@ public class TCPClient : MonoBehaviour
         }
     }
 
-    static async Task ReadExactAsync(NetworkStream s, byte[] buf, int off, int len, CancellationToken token)
+    static void ReadExact(NetworkStream s, byte[] buf, int off, int len)
     {
         int got = 0;
         while (got < len)
         {
-            int r = await s.ReadAsync(buf, off + got, len - got, token);
+            int r = s.Read(buf, off + got, len - got);
             if (r <= 0) throw new Exception("socket closed");
             got += r;
         }
@@ -357,6 +416,19 @@ public class TCPClient : MonoBehaviour
         CurrentState = s;
         Debug.Log($"[TCP] state = {s}");
         OnStateChanged?.Invoke(s);
+        if (s == State.Connected)
+            SendSessionHello("connected");
+    }
+
+    void SendSessionHello(string scene)
+    {
+        string pkg = Application.identifier;
+        string safeScene = string.IsNullOrEmpty(scene) ? "connected" : scene;
+        string json =
+            "{\"type\":\"sessionHello\",\"payload\":{\"package\":\"" + pkg +
+            "\",\"scene\":\"" + safeScene + "\"}}";
+        SendRawJson(json);
+        Debug.Log($"[TCP] sessionHello package={pkg} scene={safeScene}");
     }
 
     void OnApplicationQuit() => Disconnect();

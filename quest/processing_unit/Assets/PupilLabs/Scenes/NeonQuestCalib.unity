@@ -208,7 +208,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: ac05f1eafc6851d4da7dabd58ebfd031, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  serverIp: 192.168.0.3
+  serverIp: 192.168.0.50
   serverPort: 5051
   autoConnectOnStart: 1
   autoReconnect: 1
@@ -254,8 +254,8 @@ MonoBehaviour:
   requireCalibEndForGaze: 0
   evalAutoHide: 1
   evalHideAfterSec: 1
-  gazeDisplayHz: 200
-  gazeSmoothLerp: 1
+  gazeDisplayHz: 90
+  gazeSmoothLerp: 0
   gazeLerpFactor: 0.4
 --- !u!114 &1878009576
 MonoBehaviour:
@@ -271,7 +271,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   practiceTaskPackageName: com.PracticeMG.MRstressPRACTICE
   tcp: {fileID: 1878009573}
-  disconnectDelaySec: 0.3
+  quitAfterLaunchSec: 0.8
 --- !u!114 &1878009577
 MonoBehaviour:
   m_ObjectHideFlags: 0

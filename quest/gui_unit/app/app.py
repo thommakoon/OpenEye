@@ -25,6 +25,14 @@ from pupil_labs.realtime_api.simple import discover_one_device
 # Local
 # ==============================
 from ..core.config import DEFAULT_CONFIG as CFG
+from ..core.session import (
+    TrialSession,
+    GazeMode,
+    trial_id_from_num,
+    PKG_OPENEYE,
+    PKG_PRACTICE,
+    PKG_MAIN_STUDY,
+)
 from ..core.networking import TcpServer, EvalPlanStreamer
 from ..core.filter import ButterLPFilter
 from ..core.logger import JsonLogger
@@ -303,10 +311,14 @@ class MainWindow(QMainWindow):
     _sync_pulse_record = Signal(dict)
     _sync_status_changed = Signal(str)
     _main_study_done = Signal(dict)
+    _session_hello = Signal(dict)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Quest-Neon Calibration")
+        self.session = TrialSession()
+        self._want_study_gaze = False  # sticky: survive brief TCP drop after handoff
+        self._gaze_watchdog: Optional[QTimer] = None
         self.state = SharedState()
         self.device = None
         self.gaze_thread: Optional[GazeCollector] = None
@@ -321,7 +333,7 @@ class MainWindow(QMainWindow):
         self.eval_log_path = None
         self.eval_log_dir = None
 
-        self.gv_rate_hz = 100
+        self.gv_rate_hz = 60  # viz / Quest: latest-wins; 100Hz JSON easily backlogged on HMD
         self._gv_lock = threading.Lock()
         self._gv_latest_raw = None
         self._gaze_tx_thread: Optional[GazeTxThread] = None
@@ -348,6 +360,9 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self.btn_start_tcp); ctrl_layout.addWidget(self.tcp_status)
         ctrl_layout.addWidget(self.step_label)
 
+        self.session_status = QLabel("Session: (select trial)")
+        self.session_status.setWordWrap(True)
+
         calib_box = QGroupBox("Calibration"); calib_layout = QHBoxLayout(calib_box)
         self.btn_start_calib = QPushButton("Start Calibration (S)")
         self.btn_next_step = QPushButton("Next Step (Space)")
@@ -372,7 +387,8 @@ class MainWindow(QMainWindow):
         self.btn_launch_study = QPushButton("Start Main Study")
         self.btn_recalibrate = QPushButton("Recalibrate (OpenEye)")
         self.study_hint = QLabel(
-            "Practice = auto Fitts. Main Study = PC-commanded. Recalibrate → OpenEye calib."
+            "Handoff: gaze forced OFF, then auto ON (study) after Practice/Main connects. "
+            "Visualize checkbox now starts/stops the stream."
         )
         study_layout.addWidget(self.btn_launch_practice)
         study_layout.addWidget(self.btn_launch_study)
@@ -384,7 +400,7 @@ class MainWindow(QMainWindow):
         self.ms_sub = QSpinBox(); self.ms_sub.setRange(0, 999); self.ms_sub.setValue(0)
         self.ms_subsub = QSpinBox(); self.ms_subsub.setRange(0, 9); self.ms_subsub.setValue(0)
         self.ms_condition = QComboBox()
-        self.ms_condition.addItems(["EyeDwell", "EyePinch", "HeadDwell", "HeadPinch"])
+        self.ms_condition.addItems(["EyeDwell", "HandPinch", "EyePinch"])
         self.ms_reps = QSpinBox(); self.ms_reps.setRange(1, 10); self.ms_reps.setValue(3)
         self.ms_duration_min = QSpinBox(); self.ms_duration_min.setRange(1, 30); self.ms_duration_min.setValue(5)
         self.ms_duration_min.setSuffix(" min")
@@ -411,7 +427,8 @@ class MainWindow(QMainWindow):
         sync_layout.addWidget(self.sync_period_spin)
         sync_layout.addWidget(self.sync_status, stretch=1)
 
-        root.addWidget(ctrl_box); root.addWidget(calib_box); root.addWidget(self.canvas)
+        root.addWidget(ctrl_box); root.addWidget(self.session_status)
+        root.addWidget(calib_box); root.addWidget(self.canvas)
         root.addWidget(task_box); root.addWidget(study_box); root.addWidget(main_box); root.addWidget(sync_box)
 
         # wiring
@@ -425,6 +442,9 @@ class MainWindow(QMainWindow):
         self._sync_pulse_record.connect(self._on_sync_pulse_record)
         self._sync_status_changed.connect(self._apply_sync_status)
         self._main_study_done.connect(self._on_main_study_done)
+        self._session_hello.connect(self._on_session_hello)
+        self.p_spin.valueChanged.connect(self.on_trial_changed)
+        self.visualize.toggled.connect(self.on_visualize_toggled)
         self.btn_time_echo.clicked.connect(self.on_toggle_time_echo)
         self.btn_eval.clicked.connect(self.on_toggle_evaluation)
         self.btn_track.clicked.connect(self.on_toggle_gaze_tracking)
@@ -456,9 +476,162 @@ class MainWindow(QMainWindow):
         self.shortcut_q.setContext(Qt.ApplicationShortcut)
         self.shortcut_q.activated.connect(self.cleanup_and_close)
 
+        self.on_trial_changed(self.p_spin.value())
+
+        self._gaze_watchdog = QTimer(self)
+        self._gaze_watchdog.setInterval(500)
+        self._gaze_watchdog.timeout.connect(self._auto_resume_study_gaze)
+        self._gaze_watchdog.start()
+
+    # ---- Session / gaze state machine ----
+    def on_trial_changed(self, p_num: int):
+        self.session.set_trial(trial_id_from_num(int(p_num)))
+        self.ensure_dirs()
+        self._refresh_session_ui()
+
+    def _refresh_session_ui(self):
+        self.session_status.setText(f"Session: {self.session.format_line()}")
+        # Visualize = "gaze stream ON" for operator feedback.
+        want_viz = self.session.gaze != GazeMode.OFF
+        if self.visualize.isChecked() != want_viz:
+            self.visualize.blockSignals(True)
+            self.visualize.setChecked(want_viz)
+            self.visualize.blockSignals(False)
+        self.btn_track.setText("Stop" if self.session.gaze != GazeMode.OFF else "Start Gaze Tracking")
+
+    def _set_gaze_mode(self, mode: GazeMode, *, quiet: bool = False) -> bool:
+        """
+        Single entry for PC→Quest gazeVisual stream.
+          OFF          — stop TX (required before handoff)
+          OPENEYE_VIZ  — stream + Visualize checkbox (OpenEye Dot / ray)
+          STUDY        — stream without OpenEye viz (Practice / MainStudy cursor)
+        """
+        if mode == GazeMode.OFF:
+            self._stop_gaze_tx()
+            if self.tracking_active:
+                self.stop_gaze_logging()
+                self.tracking_active = False
+            with self._gv_lock:
+                self._gv_latest_raw = None
+            self.session.set_gaze(GazeMode.OFF)
+            self._refresh_session_ui()
+            return True
+
+        if not self.device or not self.gaze_thread:
+            if not quiet:
+                QMessageBox.information(self, "Gaze", "Connect Neon first.")
+            return False
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            if not quiet:
+                QMessageBox.information(self, "Gaze", "Quest must be connected on TCP.")
+            return False
+
+        self.ensure_dirs()
+        if not self.load_models(quiet=quiet):
+            return False
+
+        if not self.tracking_active:
+            self.start_gaze_logging()
+            self.tracking_active = True
+        if self._gaze_tx_thread is None or not self._gaze_tx_thread.is_alive():
+            self._start_gaze_tx()
+
+        self.session.set_gaze(mode)
+        if mode == GazeMode.STUDY:
+            self._want_study_gaze = True
+        elif mode == GazeMode.OPENEYE_VIZ:
+            self._want_study_gaze = False
+        self._refresh_session_ui()
+        print(f"[gaze] mode → {mode.value} (app={self.session.app})")
+        return True
+
+    def on_visualize_toggled(self, checked: bool):
+        """Visualize checkbox is a real control — not a no-op flag."""
+        if checked:
+            if self.session.app in ("practice", "main_study") or self._want_study_gaze:
+                ok = self._set_gaze_mode(GazeMode.STUDY)
+            else:
+                ok = self._set_gaze_mode(GazeMode.OPENEYE_VIZ)
+            if not ok:
+                self.visualize.blockSignals(True)
+                self.visualize.setChecked(False)
+                self.visualize.blockSignals(False)
+            return
+
+        self._want_study_gaze = False
+        if self.session.gaze != GazeMode.OFF:
+            self._set_gaze_mode(GazeMode.OFF)
+
+    def go_to(self, target_package: str, *, title: str, detail: str) -> bool:
+        ok, reason = self.session.can_handoff_to(target_package)
+        if not ok:
+            QMessageBox.information(self, title, reason)
+            return False
+
+        confirm = QMessageBox.question(
+            self, title,
+            detail + "\n\nGaze will be forced OFF, then auto-resumed after the new app connects.",
+        )
+        if confirm != QMessageBox.Yes:
+            return False
+
+        if self.eval_active:
+            self.on_toggle_evaluation()
+
+        # Sticky intent — survives brief TCP gap / reconnect after launchApp.
+        self._want_study_gaze = target_package in (PKG_PRACTICE, PKG_MAIN_STUDY)
+        self._set_gaze_mode(GazeMode.OFF, quiet=True)
+        mon = self._time_echo_monitor
+        if mon is not None and mon.is_alive():
+            mon.stop()
+            mon.join(timeout=2.0)
+            self._time_echo_monitor = None
+            self.btn_time_echo.setText("Start Quest↔PC time-echo")
+            self.status_sync("idle")
+        time.sleep(0.15)
+
+        self.tcp_thread.send_launch_app(target_package)
+        self.session.note_handoff(target_package)
+        self._refresh_session_ui()
+        for delay_ms in (500, 1500, 3000, 5000):
+            QTimer.singleShot(delay_ms, self._auto_resume_study_gaze)
+        return True
+
     # ---- Helpers ----
     def _apply_tcp_status(self, msg: str):
         self.tcp_status.setText(f"TCP: {msg}")
+        low = (msg or "").lower()
+        if low.startswith("connected"):
+            self.session.on_tcp_connected()
+            print(
+                f"[tcp] connected want_study_gaze={self._want_study_gaze} "
+                f"pending={self.session.handoff_pending or '-'}"
+            )
+            if self.session.handoff_pending:
+                QTimer.singleShot(400, self._fallback_hello_from_pending)
+            for delay_ms in (200, 800, 2000):
+                QTimer.singleShot(delay_ms, self._auto_resume_study_gaze)
+        elif "disconnect" in low or low.startswith("recv error") or low.startswith("quest disconnect"):
+            # Pause TX into dead socket, but KEEP _want_study_gaze.
+            # Old bug: after fallback cleared handoff_pending, disconnect permanently
+            # killed STUDY — only quit/reenter (new Connected without that kill) fixed it.
+            if self.session.gaze != GazeMode.OFF:
+                print(f"[tcp] disconnect — pausing TX (want_study={self._want_study_gaze})")
+                self._stop_gaze_tx()
+                self.session.set_gaze(GazeMode.OFF)
+            self.session.on_tcp_disconnected()
+        self._refresh_session_ui()
+
+    def _fallback_hello_from_pending(self):
+        pending = self.session.handoff_pending
+        if not pending or not self.session.tcp_connected:
+            return
+        if self.session.app not in ("none", "unknown"):
+            return
+        self.session.on_session_hello(pending, "connected")
+        print(f"[session] fallback hello from handoff_pending={pending}")
+        self._refresh_session_ui()
+        self._auto_resume_study_gaze()
 
     def _apply_sync_status(self, msg: str):
         self.sync_status.setText(f"Sync: {msg}")
@@ -493,10 +666,9 @@ class MainWindow(QMainWindow):
             self._gv_latest_raw = (float(ts), int(ts_ns), float(x_f), float(y_f))
 
     def _send_latest_gaze_visual(self):
-        if not self.tracking_active:
+        if self.session.gaze == GazeMode.OFF:
             return
-        chk = getattr(self, "visualize", None)
-        if not (chk and chk.isChecked()):
+        if not self.tracking_active:
             return
         if not (self.tcp_thread and self.tcp_thread.conn):
             return
@@ -568,6 +740,7 @@ class MainWindow(QMainWindow):
         self.state.step = 0
         self.state.ended = False
         self.state.recording = True
+        self.session.on_calib_started()
         self.step_label.setText("Step: 1 / 25 — fixate, then Next")
         self.btn_start_calib.setEnabled(False)
         self.btn_next_step.setEnabled(True)
@@ -591,6 +764,13 @@ class MainWindow(QMainWindow):
             self.on_toggle_evaluation()
         if self.tcp_thread and self.tcp_thread.conn:
             self.tcp_thread.send_reset_calib()
+        if self.session.model_ready:
+            with self.session.lock:
+                self.session.openeye = "ready"
+        else:
+            with self.session.lock:
+                self.session.openeye = "no_model"
+        self._refresh_session_ui()
 
     # ---- TCP ----
     def on_start_tcp(self):
@@ -688,9 +868,41 @@ class MainWindow(QMainWindow):
         if mtype == "mainStudyDone":
             payload = msg.get("payload") or {}
             self._main_study_done.emit(dict(payload))
+            return
+        if mtype == "sessionHello":
+            payload = msg.get("payload") or {}
+            self._session_hello.emit(dict(payload))
+            return
+
+    def _on_session_hello(self, payload: dict):
+        package = str(payload.get("package", ""))
+        scene = str(payload.get("scene", ""))
+        pending = self.session.on_session_hello(package, scene)
+        print(f"[sessionHello] package={package} scene={scene} pending={pending or '-'}")
+        if self.session.app in ("practice", "main_study"):
+            self._want_study_gaze = True
+        elif self.session.app == "openeye":
+            self._want_study_gaze = False
+        self._refresh_session_ui()
+        QTimer.singleShot(200, self._auto_resume_study_gaze)
+
+    def _auto_resume_study_gaze(self):
+        if not self._want_study_gaze:
+            return
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            return
+        if self.session.gaze == GazeMode.STUDY and self._gaze_tx_thread is not None and self._gaze_tx_thread.is_alive():
+            return
+        # Infer practice/main if still unknown (old Practice APK, no sessionHello).
+        if self.session.app in ("none", "unknown") and self.session.handoff_pending:
+            self.session.on_session_hello(self.session.handoff_pending, "connected")
+        ok = self._set_gaze_mode(GazeMode.STUDY, quiet=True)
+        print(f"[gaze] auto-resume STUDY: {'ok' if ok else 'FAILED'} app={self.session.app}")
+        self._refresh_session_ui()
 
     def _on_main_study_done(self, payload: dict):
         self._ms_running = False
+        self.session.on_main_study_done()
         cond = payload.get("condition", "?")
         ok = payload.get("ok", True)
         sub = payload.get("sub_num", "?")
@@ -702,6 +914,9 @@ class MainWindow(QMainWindow):
         )
         self.btn_ms_start.setEnabled(True)
         print(f"[mainStudyDone] {payload}")
+        self._want_study_gaze = True
+        self._auto_resume_study_gaze()
+        self._refresh_session_ui()
 
     def _on_sync_pulse_record(self, record: dict):
         # Prefer Companion HTTP /api/event so we do NOT call device.send_event
@@ -830,81 +1045,49 @@ class MainWindow(QMainWindow):
         self.state.stop_tracking()
 
     def on_toggle_gaze_tracking(self):
-        if not self.device or not self.gaze_thread:
-            QMessageBox.information(self, "Info", "Connect Neon")
+        if self.session.gaze != GazeMode.OFF:
+            self._want_study_gaze = False
+            self._set_gaze_mode(GazeMode.OFF)
             return
-        if not (self.tcp_thread and self.tcp_thread.conn):
-            QMessageBox.information(self, "Info", "Start TCP server")
-            return
-        
-        if not self.tracking_active:
-            if not self.load_models():
-                return
-            self.visualize.setChecked(True)
-            self.start_gaze_logging()
-            self.tracking_active = True
-            self.btn_track.setText("Stop")
-            self._start_gaze_tx()
+
+        if self.session.app in ("practice", "main_study") or self._want_study_gaze:
+            self._set_gaze_mode(GazeMode.STUDY)
         else:
-            self.stop_gaze_logging()
-            self.tracking_active = False
-            self.btn_track.setText("Start Gaze Tracking")
-            self._stop_gaze_tx()
-            with self._gv_lock:
-                self._gv_latest_raw = None
+            self._set_gaze_mode(GazeMode.OPENEYE_VIZ)
 
-    # ---- Study handoff ----
     def on_launch_practice(self):
-        if not (self.tcp_thread and self.tcp_thread.conn):
-            QMessageBox.information(
-                self, "Start Practice",
-                "Start the TCP server and connect the Quest app first.",
-            )
-            return
-
-        confirm = QMessageBox.question(
-            self, "Start Practice",
-            "Launch PracticeTask (auto Fitts) on the Quest?\n"
-            "Package: com.PracticeMG.MRstressPRACTICE",
+        self.go_to(
+            PKG_PRACTICE,
+            title="Start Practice",
+            detail=(
+                "Launch PracticeTask on the Quest?\n"
+                f"Trial: {self.session.trial_id}\n"
+                f"Package: {PKG_PRACTICE}"
+            ),
         )
-        if confirm != QMessageBox.Yes:
-            return
-
-        if self.eval_active:
-            self.on_toggle_evaluation()
-
-        self.tcp_thread.send_launch_app("com.PracticeMG.MRstressPRACTICE")
-        self.step_label.setText("Step: launching PracticeTask on Quest...")
 
     def on_launch_study(self):
-        if not (self.tcp_thread and self.tcp_thread.conn):
-            QMessageBox.information(self, "Start Main Study", "Start the TCP server and connect the Quest app first.")
-            return
-
-        confirm = QMessageBox.question(
-            self, "Start Main Study",
-            "Launch MainStudy (PC-commanded) on the Quest and close OpenEye there?\n"
-            "Make sure calibration looks good first.\n"
-            "Package: com.PracticeMG.MRstress",
+        self.go_to(
+            PKG_MAIN_STUDY,
+            title="Start Main Study",
+            detail=(
+                "Launch MainStudy (PC-commanded) on the Quest?\n"
+                f"Trial: {self.session.trial_id}\n"
+                f"Package: {PKG_MAIN_STUDY}"
+            ),
         )
-        if confirm != QMessageBox.Yes:
-            return
 
-        # Stop the calibration-eval saccade stream, but KEEP gaze tracking running:
-        # after MainStudy reconnects, the PC auto-resumes streaming gazeVisual to it.
-        if self.eval_active:
-            self.on_toggle_evaluation()
-
-        if not self.tracking_active:
-            QMessageBox.information(
-                self, "Start Main Study",
-                "Note: Gaze Tracking is OFF. Eye blocks in MainStudy will have no gaze "
-                "until you press 'Start Gaze Tracking' (with Visualize) here after it connects."
-            )
-
-        self.tcp_thread.send_launch_app("com.PracticeMG.MRstress")
-        self.ms_status.setText("Status: launching MainStudy — wait for Quest IDLE")
-        self.step_label.setText("Step: launching MainStudy on Quest (gaze streaming stays on)...")
+    def on_recalibrate(self):
+        self._want_study_gaze = False
+        self.go_to(
+            PKG_OPENEYE,
+            title="Recalibrate",
+            detail=(
+                "Launch OpenEye calibration on the Quest?\n"
+                f"Trial: {self.session.trial_id}\n"
+                f"Package: {PKG_OPENEYE}"
+            ),
+        )
 
     def on_main_study_start(self):
         if not (self.tcp_thread and self.tcp_thread.conn):
@@ -913,7 +1096,7 @@ class MainWindow(QMainWindow):
                 "Quest MainStudy must be connected on TCP first (IDLE screen).",
             )
             return
-        if self._ms_running:
+        if self._ms_running or self.session.main == "running":
             QMessageBox.information(
                 self, "Main Study",
                 "A condition is already running. Wait for mainStudyDone (or restart Quest).",
@@ -929,6 +1112,7 @@ class MainWindow(QMainWindow):
         confirm = QMessageBox.question(
             self, "Start condition",
             f"Start on Quest?\n\n"
+            f"Trial: {self.session.trial_id}\n"
             f"Participant {sub_num}-{subsub_num}\n"
             f"Condition: {condition}\n"
             f"Fitts reps: {reps}\n"
@@ -938,11 +1122,9 @@ class MainWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
-        if not self.tracking_active and condition.startswith("Eye"):
-            QMessageBox.information(
-                self, "Main Study",
-                "Gaze Tracking is OFF. Turn it on (and Visualize) for eye conditions.",
-            )
+        if condition.startswith("Eye"):
+            if not self._set_gaze_mode(GazeMode.STUDY):
+                return
 
         self.tcp_thread.send_main_study_start(
             sub_num=sub_num,
@@ -952,44 +1134,29 @@ class MainWindow(QMainWindow):
             duration_sec=duration_sec,
         )
         self._ms_running = True
+        self.session.on_main_study_started()
         self.btn_ms_start.setEnabled(False)
         self.ms_status.setText(
             f"Status: running {condition} ×{reps} ({duration_sec // 60} min each) "
             f"for {sub_num}-{subsub_num}…"
         )
-
-    def on_recalibrate(self):
-        if not (self.tcp_thread and self.tcp_thread.conn):
-            QMessageBox.information(
-                self, "Recalibrate",
-                "Start the TCP server and connect MainStudy on the Quest first.",
-            )
-            return
-
-        confirm = QMessageBox.question(
-            self, "Recalibrate",
-            "Launch the OpenEye calibration app on the Quest and close MainStudy?\n"
-            "After calibration, use Start Study to return to MainStudy.",
-        )
-        if confirm != QMessageBox.Yes:
-            return
-
-        if self.eval_active:
-            self.on_toggle_evaluation()
-        if self.tracking_active:
-            self.on_toggle_gaze_tracking()
-
-        self.tcp_thread.send_launch_app("org.MixedRealityToolkit.MRTK3Sample")
-        self.step_label.setText("Step: launching OpenEye on Quest for recalibration...")
-
-    def load_models(self):
+        self._refresh_session_ui()
+    def load_models(self, quiet: bool = False):
+        self.ensure_dirs()
         model_dir = os.path.join(self.participant_dir, "models")
+        model_dir = os.path.abspath(model_dir)
         if not os.path.isdir(model_dir):
-            QMessageBox.warning(self, "Models", f"Models folder not found: {model_dir}")
+            msg = f"Models folder not found: {model_dir}"
+            print(f"[models] {msg}")
+            if not quiet:
+                QMessageBox.warning(self, "Models", msg)
             return False
         self.models = load_models(model_dir)
-        if not self.models:
-            QMessageBox.warning(self, "Models", "No valid model JSON found in Models directory.")
+        if not self.models or "ridge_biquadratic" not in self.models:
+            msg = f"No ridge_biquadratic model in {model_dir}"
+            print(f"[models] {msg}")
+            if not quiet:
+                QMessageBox.warning(self, "Models", msg)
             return False
         return True
     
@@ -1107,6 +1274,8 @@ class MainWindow(QMainWindow):
             self.btn_next_step.setEnabled(False)
             self.step_label.setText("Step: done")
             if model_dir:
+                self.session.on_calib_finished()
+                self.load_models()
                 QMessageBox.information(
                     self, "Calibration",
                     f"Calibration complete.\nModels saved to:\n{model_dir}",
@@ -1117,6 +1286,7 @@ class MainWindow(QMainWindow):
                     "Calibration finished but models were NOT saved.\n"
                     "Check the terminal for [CALIB] errors (need 25 gaze events).",
                 )
+            self._refresh_session_ui()
 
     # ---- Save ----
     def save_csv(self):

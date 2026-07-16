@@ -20,6 +20,8 @@ public class DotGridCalibrator : MonoBehaviour
     GameObject _dot;
     Vector2[,] _angles;
     int _total;
+    Transform _cachedEyeTf;
+    float _nextEyeResolveTime;
 
     enum Mode { None, StepAngles, Meters }
     Mode _mode = Mode.None;
@@ -39,8 +41,7 @@ public class DotGridCalibrator : MonoBehaviour
     {
         if (_mode == Mode.None || _dot == null) return;
 
-        if (xrCamera == null) xrCamera = Camera.main;
-        var refTf = referenceForward ? referenceForward : (xrCamera ? xrCamera.transform : null);
+        var refTf = ResolveVrEyeTransform();
         if (refTf == null) return;
 
         Vector3 local;
@@ -58,6 +59,55 @@ public class DotGridCalibrator : MonoBehaviour
 
         _dot.transform.position = refTf.TransformPoint(local);
         _dot.transform.rotation = Quaternion.LookRotation(refTf.forward, refTf.up);
+    }
+
+    /// <summary>
+    /// Prefer CenterEyeAnchor / Camera.main, but cache — Find every LateUpdate stalls HMD.
+    /// </summary>
+    Transform ResolveVrEyeTransform()
+    {
+        if (referenceForward != null && referenceForward.gameObject.activeInHierarchy)
+            return referenceForward;
+
+        if (_cachedEyeTf != null && _cachedEyeTf.gameObject.activeInHierarchy)
+            return _cachedEyeTf;
+
+        float now = Time.unscaledTime;
+        if (now < _nextEyeResolveTime && _cachedEyeTf != null)
+            return _cachedEyeTf;
+        _nextEyeResolveTime = now + 0.5f;
+
+        var centerEye = GameObject.Find("CenterEyeAnchor");
+        if (centerEye != null)
+        {
+            xrCamera = centerEye.GetComponent<Camera>() ?? xrCamera;
+            _cachedEyeTf = centerEye.transform;
+            return _cachedEyeTf;
+        }
+
+        if (xrCamera != null && xrCamera.enabled && xrCamera.gameObject.activeInHierarchy)
+        {
+            _cachedEyeTf = xrCamera.transform;
+            return _cachedEyeTf;
+        }
+
+        xrCamera = Camera.main;
+        if (xrCamera != null)
+        {
+            _cachedEyeTf = xrCamera.transform;
+            return _cachedEyeTf;
+        }
+
+        foreach (var cam in Camera.allCameras)
+        {
+            if (cam != null && cam.enabled && cam.gameObject.activeInHierarchy)
+            {
+                xrCamera = cam;
+                _cachedEyeTf = cam.transform;
+                return _cachedEyeTf;
+            }
+        }
+        return null;
     }
 
     void BuildAngles()
