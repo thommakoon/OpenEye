@@ -37,36 +37,53 @@ def echo_rtt_ms(*, pc_t1_ms: int, pc_t2_ms: int) -> int:
     return int(pc_t2_ms) - int(pc_t1_ms)
 
 
-def summarize_echoes(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Build sync payload from time-echo samples (each has offset_ms, rtt_ms)."""
+def _summarize_offset_samples(
+    samples: list[dict[str, Any]],
+    *,
+    offset_key: str,
+    rtt_key: str = "rtt_ms",
+) -> dict[str, float | int] | None:
     if not samples:
         return None
-
-    offsets_ms = [float(s["offset_ms"]) for s in samples]
-    rtts_ms = [float(s["rtt_ms"]) for s in samples]
+    offsets_ms = [float(s[offset_key]) for s in samples]
+    rtts_ms = [float(s[rtt_key]) for s in samples if s.get(rtt_key) is not None]
     median_ms = statistics.median(offsets_ms)
     mean_ms = statistics.mean(offsets_ms)
     spread_ms = statistics.stdev(offsets_ms) if len(offsets_ms) > 1 else 0.0
-    rtt_mean = statistics.mean(rtts_ms)
+    rtt_mean = statistics.mean(rtts_ms) if rtts_ms else 0.0
     rtt_std = statistics.stdev(rtts_ms) if len(rtts_ms) > 1 else 0.0
-
-    offset_ns = int(round(median_ms * 1_000_000))
-    spread_ns = int(round(spread_ms * 1_000_000))
-
     return {
-        "version": 2,
-        "method": "time_echo",
-        "offset_quest_to_pc_ns": offset_ns,
-        "offset_quest_to_pc_ms_median": float(median_ms),
-        "offset_quest_to_pc_ms_mean": float(mean_ms),
-        "offset_spread_std_ns": spread_ns,
+        "offset_ns": int(round(median_ms * 1_000_000)),
+        "offset_ms_median": float(median_ms),
+        "offset_ms_mean": float(mean_ms),
+        "offset_spread_std_ns": int(round(spread_ms * 1_000_000)),
         "offset_spread_std_ms": float(spread_ms),
         "roundtrip_ms_mean": float(rtt_mean),
         "roundtrip_ms_std": float(rtt_std),
         "sample_count": len(samples),
+    }
+
+
+def summarize_echoes(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Build Quest↔PC sync payload from time-echo samples (offset_ms, rtt_ms)."""
+    stats = _summarize_offset_samples(samples, offset_key="offset_ms")
+    if stats is None:
+        return None
+
+    return {
+        "version": 2,
+        "method": "time_echo",
+        "offset_quest_to_pc_ns": stats["offset_ns"],
+        "offset_quest_to_pc_ms_median": stats["offset_ms_median"],
+        "offset_quest_to_pc_ms_mean": stats["offset_ms_mean"],
+        "offset_spread_std_ns": stats["offset_spread_std_ns"],
+        "offset_spread_std_ms": stats["offset_spread_std_ms"],
+        "roundtrip_ms_mean": stats["roundtrip_ms_mean"],
+        "roundtrip_ms_std": stats["roundtrip_ms_std"],
+        "sample_count": stats["sample_count"],
         "formula": "offset_ms = ((pc_t1 + pc_t2) / 2) - quest_tH; pc_ms = quest_ms + offset_ms",
         "usage": "t_pc_ns = quest_unix_ms * 1e6 + offset_quest_to_pc_ns",
-        "samples": [
+        "quest_samples": [
             {
                 "pc_t1_ms": s.get("pc_t1_ms"),
                 "pc_t2_ms": s.get("pc_t2_ms"),
@@ -74,21 +91,36 @@ def summarize_echoes(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
                 "offset_ms": s.get("offset_ms"),
                 "rtt_ms": s.get("rtt_ms"),
             }
-            for s in samples
+            for s in samples[-20:]
         ],
         "written_unix_ns": time.time_ns(),
     }
 
 
-def merge_phone_offset(payload: dict[str, Any], offset_phone_to_pc_ns: int, **extra: Any) -> dict[str, Any]:
+def summarize_phone_echoes(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Build Neon phone↔PC stats from Pupil time-echo samples (offset_ms)."""
+    stats = _summarize_offset_samples(samples, offset_key="offset_ms")
+    if stats is None:
+        return None
+    return {
+        "offset_phone_to_pc_ns": stats["offset_ns"],
+        "phone_offset_ms_median": stats["offset_ms_median"],
+        "phone_offset_ms_mean": stats["offset_ms_mean"],
+        "phone_offset_spread_std_ns": stats["offset_spread_std_ns"],
+        "phone_offset_spread_std_ms": stats["offset_spread_std_ms"],
+        "phone_rtt_ms_mean": stats["roundtrip_ms_mean"],
+        "phone_rtt_ms_std": stats["roundtrip_ms_std"],
+        "phone_sample_count": stats["sample_count"],
+    }
+
+
+def merge_phone_offset(payload: dict[str, Any], phone_stats: dict[str, Any]) -> dict[str, Any]:
     out = dict(payload)
-    out["offset_phone_to_pc_ns"] = int(offset_phone_to_pc_ns)
-    out.update(extra)
-    # Convenience: Quest→phone if both legs known (same PC hub).
-    if "offset_quest_to_pc_ns" in out:
-        out["offset_quest_to_phone_ns"] = int(out["offset_quest_to_pc_ns"]) - int(
-            offset_phone_to_pc_ns
-        )
+    out.update(phone_stats)
+    phone_ns = phone_stats.get("offset_phone_to_pc_ns")
+    if phone_ns is not None and "offset_quest_to_pc_ns" in out:
+        out["offset_quest_to_phone_ns"] = int(out["offset_quest_to_pc_ns"]) - int(phone_ns)
+    out["usage_phone"] = "t_pc_ns = phone_t_utc_ns + offset_phone_to_pc_ns"
     return out
 
 
@@ -181,6 +213,44 @@ def compute_sync_from_pulses(
         "pulses": pulse_rows,
         "written_unix_ns": time.time_ns(),
     }
+
+
+def load_sync_echo_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
+def compute_sync_from_echo_logs(
+    quest_records: list[dict[str, Any]],
+    neon_records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    quest_samples = [
+        r for r in quest_records
+        if r.get("type") == "questEcho" and r.get("offset_ms") is not None
+    ]
+    neon_samples = [
+        r for r in neon_records
+        if r.get("type") == "neonEcho" and r.get("offset_ms") is not None
+    ]
+    payload = summarize_echoes(quest_samples)
+    phone_stats = summarize_phone_echoes(neon_samples)
+    if payload is None and phone_stats is None:
+        return None
+    if payload is None:
+        payload = {
+            "version": 2,
+            "method": "time_echo_neon_only",
+            "written_unix_ns": time.time_ns(),
+        }
+    if phone_stats is not None:
+        payload = merge_phone_offset(payload, phone_stats)
+    return payload
 
 
 def load_sync_pulses_jsonl(path: str | Path) -> list[dict[str, Any]]:

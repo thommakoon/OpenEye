@@ -16,6 +16,7 @@ class MappingConfig:
     """Mapping function parameters"""
     ridge_alpha: float = 0.01   # Regularization strength for ridge biquadratic mapping
     window_width: int = 100     # Number of samples averaged before each event (calibration)
+    min_step_dwell_s: float = 1.0  # Min seconds on each calib dot before Next is allowed
 
 
 @dataclass(frozen=True)
@@ -40,11 +41,20 @@ class EvalConfig:
 
 
 @dataclass(frozen=True)
+class Urp2026Config:
+    """URP2026 phone PC-bridge (QT Py CMD:* + both-recording control)"""
+    default_host: str = "192.168.43.1"  # IP shown in URP2026 after "Start PC bridge"
+    port: int = 8765
+    timeout_s: float = 30.0
+
+
+@dataclass(frozen=True)
 class AppConfig:
     canvas: CanvasConfig = CanvasConfig()
     filt: FilterConfig = FilterConfig()
     mapping: MappingConfig = MappingConfig()
     eval: EvalConfig = EvalConfig()
+    urp2026: Urp2026Config = Urp2026Config()
 
 
 DEFAULT_CONFIG = AppConfig()

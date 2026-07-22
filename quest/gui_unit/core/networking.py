@@ -192,6 +192,17 @@ class TcpServer(threading.Thread):
             },
         })
 
+    def send_main_study_stop(self):
+        """Abort MainStudy on Quest and return it to IDLE."""
+        self._send({"type": "mainStudyStop", "payload": {}})
+
+    def send_show_ray(self, visible: bool):
+        """Show/hide pointing ray visual on Practice or MainStudy."""
+        self._send({
+            "type": "showRay",
+            "payload": {"visible": bool(visible)},
+        })
+
     def request_time_echo(self, timeout_s: float = 1.0) -> Optional[dict[str, Any]]:
         """Neon-style round-trip: PC t1 → Quest replies (t1, tH) → PC t2.
 

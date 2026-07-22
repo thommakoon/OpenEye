@@ -4,19 +4,18 @@ import os
 import threading
 import time
 import json
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Optional, List, Dict
 
 import pandas as pd
 import numpy as np
 # ---- PySide6 GUI ----
-from PySide6.QtCore import Qt, QTimer, QPointF, Signal
+from PySide6.QtCore import Qt, QTimer, QPointF, Signal, QSettings
 from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QCheckBox, QSpinBox, QComboBox, QGroupBox, QMessageBox
+    QLabel, QPushButton, QCheckBox, QSpinBox, QComboBox, QGroupBox, QMessageBox,
+    QLineEdit
 )
 # ---- Pupil Labs Real-Time API ----
 from pupil_labs.realtime_api.simple import discover_one_device
@@ -34,10 +33,10 @@ from ..core.session import (
     PKG_MAIN_STUDY,
 )
 from ..core.networking import TcpServer, EvalPlanStreamer
+from ..core.urp2026_client import send_command as urp_send_command, Urp2026Error
 from ..core.filter import ButterLPFilter
 from ..core.logger import JsonLogger
-from ..core.sync_offset import compute_sync_from_pulses, write_sync_json
-from ..core.time_echo_monitor import QuestTimeEchoMonitor
+from ..core.time_echo_monitor import PcHubSyncMonitor
 from ..core.mapping import (
     normalize_neon_xy,
     map_biquadratic, map_ridge_biquadratic,
@@ -312,10 +311,12 @@ class MainWindow(QMainWindow):
     _sync_status_changed = Signal(str)
     _main_study_done = Signal(dict)
     _session_hello = Signal(dict)
+    _urp_result = Signal(str, int, str, bool)  # command, http_code, body, ok
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Quest-Neon Calibration")
+        self._settings = QSettings("OpenEye", "QuestNeonGUI")
         self.session = TrialSession()
         self._want_study_gaze = False  # sticky: survive brief TCP drop after handoff
         self._gaze_watchdog: Optional[QTimer] = None
@@ -341,7 +342,14 @@ class MainWindow(QMainWindow):
         self.sync_pulses_path = None
         self.sync_json_path = None
         self._sync_pulse_batch: List[dict] = []
-        self._time_echo_monitor: Optional[QuestTimeEchoMonitor] = None
+        self._time_echo_monitor: Optional[PcHubSyncMonitor] = None
+        self._quest_echo_logger: Optional[JsonLogger] = None
+        self._neon_echo_logger: Optional[JsonLogger] = None
+        self._hub_sync_user_stopped = False
+        self._calib_dot_shown_at = 0.0
+        self._calib_dwell_timer = QTimer(self)
+        self._calib_dwell_timer.setSingleShot(True)
+        self._calib_dwell_timer.timeout.connect(self._on_calib_dwell_ready)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -365,10 +373,13 @@ class MainWindow(QMainWindow):
 
         calib_box = QGroupBox("Calibration"); calib_layout = QHBoxLayout(calib_box)
         self.btn_start_calib = QPushButton("Start Calibration (S)")
-        self.btn_next_step = QPushButton("Next Step (Space)")
+        self.btn_next_step = QPushButton("Next Step (G/H/I/J)")
         self.btn_reset_calib = QPushButton("Reset Calibration")
         self.btn_next_step.setEnabled(False)
-        self.calib_hint = QLabel("1. Connect Neon  2. Start TCP  3. Launch Quest  4. Start Calibration  5. Fixate each dot, Next Step ×25")
+        self.calib_hint = QLabel(
+            "1. Connect Neon  2. Start TCP  3. Open calib APK on Quest (manual)  "
+            "4. Start Calibration  5. Fixate each dot ≥1s, then Next (G/H/I/J) ×25"
+        )
         calib_layout.addWidget(self.btn_start_calib)
         calib_layout.addWidget(self.btn_next_step)
         calib_layout.addWidget(self.btn_reset_calib)
@@ -380,43 +391,72 @@ class MainWindow(QMainWindow):
         self.btn_eval = QPushButton("Start Evaluation")
         self.btn_track = QPushButton("Start Gaze Tracking")
         self.visualize = QCheckBox("Visualize")
-        task_layout.addWidget(self.btn_eval); task_layout.addWidget(self.btn_track); task_layout.addWidget(self.visualize)
+        self.chk_show_ray = QCheckBox("Show Quest ray")
+        self.chk_show_ray.setChecked(True)
+        self.chk_show_ray.setToolTip(
+            "Toggle eye/head/hand ray visuals on the connected Practice or MainStudy app."
+        )
+        task_layout.addWidget(self.btn_eval)
+        task_layout.addWidget(self.btn_track)
+        task_layout.addWidget(self.visualize)
+        task_layout.addWidget(self.chk_show_ray)
 
-        study_box = QGroupBox("Study Handoff"); study_layout = QHBoxLayout(study_box)
+        # Option 1 (pilot): APK launchApp handoff is off the critical path.
+        # Open Calib / Practice / Main manually on Quest; PC = TCP + gaze + commander.
+        # Debug checkbox re-enables the old launchApp buttons only.
+        study_box = QGroupBox("Study apps (manual launch — no APK transfer)")
+        study_layout = QVBoxLayout(study_box)
+        self.study_hint = QLabel(
+            "Operator flow: on Quest open Calib → calibrate → quit → open Practice or Main Study. "
+            "On PC: Connect Neon → Start TCP → Gaze Tracking / Visualize → "
+            "(Main) use commander below. Do not rely on APK transfer."
+        )
+        self.study_hint.setWordWrap(True)
+        self.chk_debug_handoff = QCheckBox("Debug: show APK handoff buttons (launchApp)")
+        self.chk_debug_handoff.setChecked(False)
+        handoff_row = QHBoxLayout()
         self.btn_launch_practice = QPushButton("Start Practice")
         self.btn_launch_study = QPushButton("Start Main Study")
         self.btn_recalibrate = QPushButton("Recalibrate (OpenEye)")
-        self.study_hint = QLabel(
-            "Handoff: gaze forced OFF, then auto ON (study) after Practice/Main connects. "
-            "Visualize checkbox now starts/stops the stream."
+        handoff_row.addWidget(self.btn_launch_practice)
+        handoff_row.addWidget(self.btn_launch_study)
+        handoff_row.addWidget(self.btn_recalibrate)
+        self._handoff_buttons = (
+            self.btn_launch_practice,
+            self.btn_launch_study,
+            self.btn_recalibrate,
         )
-        study_layout.addWidget(self.btn_launch_practice)
-        study_layout.addWidget(self.btn_launch_study)
-        study_layout.addWidget(self.btn_recalibrate)
-        study_layout.addWidget(self.study_hint, stretch=1)
+        study_layout.addWidget(self.study_hint)
+        study_layout.addWidget(self.chk_debug_handoff)
+        study_layout.addLayout(handoff_row)
+        self._set_handoff_ui_visible(False)
 
         main_box = QGroupBox("Main Study commander (MRstress IDLE)")
         main_layout = QHBoxLayout(main_box)
         self.ms_sub = QSpinBox(); self.ms_sub.setRange(0, 999); self.ms_sub.setValue(0)
         self.ms_subsub = QSpinBox(); self.ms_subsub.setRange(0, 9); self.ms_subsub.setValue(0)
         self.ms_condition = QComboBox()
-        self.ms_condition.addItems(["EyeDwell", "HandPinch", "EyePinch"])
+        self.ms_condition.addItems(["HeadPinch", "HandPinch", "EyePinch"])
         self.ms_reps = QSpinBox(); self.ms_reps.setRange(1, 10); self.ms_reps.setValue(3)
         self.ms_duration_min = QSpinBox(); self.ms_duration_min.setRange(1, 30); self.ms_duration_min.setValue(5)
         self.ms_duration_min.setSuffix(" min")
         self.btn_ms_start = QPushButton("Start condition")
-        self.ms_status = QLabel("Status: idle (Quest MainStudy must be connected)")
+        self.btn_ms_stop = QPushButton("Stop → IDLE")
+        self.ms_status = QLabel(
+            "Status: idle — open MainStudy APK on Quest manually, then Start condition"
+        )
         main_layout.addWidget(QLabel("sub")); main_layout.addWidget(self.ms_sub)
         main_layout.addWidget(QLabel("subsub")); main_layout.addWidget(self.ms_subsub)
         main_layout.addWidget(QLabel("condition")); main_layout.addWidget(self.ms_condition)
         main_layout.addWidget(QLabel("reps")); main_layout.addWidget(self.ms_reps)
         main_layout.addWidget(QLabel("each")); main_layout.addWidget(self.ms_duration_min)
         main_layout.addWidget(self.btn_ms_start)
+        main_layout.addWidget(self.btn_ms_stop)
         main_layout.addWidget(self.ms_status, stretch=1)
 
-        sync_box = QGroupBox("Clock sync (PC hub — Neon-style time-echo)")
+        sync_box = QGroupBox("Clock sync (PC hub — Quest + Neon time-echo)")
         sync_layout = QHBoxLayout(sync_box)
-        self.btn_time_echo = QPushButton("Start Quest↔PC time-echo")
+        self.btn_time_echo = QPushButton("Start PC hub sync")
         self.sync_period_spin = QSpinBox()
         self.sync_period_spin.setRange(1, 60)
         self.sync_period_spin.setValue(1)
@@ -427,9 +467,48 @@ class MainWindow(QMainWindow):
         sync_layout.addWidget(self.sync_period_spin)
         sync_layout.addWidget(self.sync_status, stretch=1)
 
+        urp_box = QGroupBox("URP2026 recorder (QT Py + both-recording via phone bridge :8765)")
+        urp_layout = QVBoxLayout(urp_box)
+
+        urp_conn = QHBoxLayout()
+        self.urp_host = QLineEdit()
+        self.urp_host.setPlaceholderText("phone IP (URP2026 → Start PC bridge)")
+        self.urp_port = QSpinBox(); self.urp_port.setRange(1, 65535)
+        self.urp_port.setValue(int(self._settings.value("urp2026/port", CFG.urp2026.port, type=int)))
+        self.urp_host.setText(str(self._settings.value("urp2026/host", CFG.urp2026.default_host)))
+        self.btn_urp_health = QPushButton("Health")
+        urp_conn.addWidget(QLabel("host")); urp_conn.addWidget(self.urp_host, stretch=1)
+        urp_conn.addWidget(QLabel("port")); urp_conn.addWidget(self.urp_port)
+        urp_conn.addWidget(self.btn_urp_health)
+
+        urp_cmds = QHBoxLayout()
+        self.btn_urp_calibrate = QPushButton("Calibrate")
+        self.btn_urp_start = QPushButton("Start")
+        self.btn_urp_stop = QPushButton("Stop")
+        self.btn_urp_next = QPushButton("Next")
+        self.btn_urp_status = QPushButton("Status")
+        self.btn_urp_rec_start = QPushButton("Record Start")
+        self.btn_urp_rec_stop = QPushButton("Record Stop")
+        for b in (self.btn_urp_calibrate, self.btn_urp_start, self.btn_urp_stop,
+                  self.btn_urp_next, self.btn_urp_status,
+                  self.btn_urp_rec_start, self.btn_urp_rec_stop):
+            urp_cmds.addWidget(b)
+
+        self.urp_status = QLabel("URP2026: idle"); self.urp_status.setWordWrap(True)
+        urp_layout.addLayout(urp_conn)
+        urp_layout.addLayout(urp_cmds)
+        urp_layout.addWidget(self.urp_status)
+
+        self._urp_buttons = [
+            self.btn_urp_health, self.btn_urp_calibrate, self.btn_urp_start,
+            self.btn_urp_stop, self.btn_urp_next, self.btn_urp_status,
+            self.btn_urp_rec_start, self.btn_urp_rec_stop,
+        ]
+
         root.addWidget(ctrl_box); root.addWidget(self.session_status)
         root.addWidget(calib_box); root.addWidget(self.canvas)
         root.addWidget(task_box); root.addWidget(study_box); root.addWidget(main_box); root.addWidget(sync_box)
+        root.addWidget(urp_box)
 
         # wiring
         self.btn_connect_neon.clicked.connect(self.on_connect_neon)
@@ -445,14 +524,30 @@ class MainWindow(QMainWindow):
         self._session_hello.connect(self._on_session_hello)
         self.p_spin.valueChanged.connect(self.on_trial_changed)
         self.visualize.toggled.connect(self.on_visualize_toggled)
+        self.chk_show_ray.toggled.connect(self.on_show_ray_toggled)
         self.btn_time_echo.clicked.connect(self.on_toggle_time_echo)
         self.btn_eval.clicked.connect(self.on_toggle_evaluation)
         self.btn_track.clicked.connect(self.on_toggle_gaze_tracking)
         self.btn_launch_practice.clicked.connect(self.on_launch_practice)
         self.btn_launch_study.clicked.connect(self.on_launch_study)
         self.btn_ms_start.clicked.connect(self.on_main_study_start)
+        self.btn_ms_stop.clicked.connect(self.on_main_study_stop)
         self.btn_recalibrate.clicked.connect(self.on_recalibrate)
+        self.chk_debug_handoff.toggled.connect(self._set_handoff_ui_visible)
         self._ms_running = False
+
+        # URP2026 recorder wiring
+        self.btn_urp_health.clicked.connect(lambda: self._urp_send("health"))
+        self.btn_urp_calibrate.clicked.connect(lambda: self._urp_send("calibrate"))
+        self.btn_urp_start.clicked.connect(lambda: self._urp_send("start"))
+        self.btn_urp_stop.clicked.connect(lambda: self._urp_send("stop"))
+        self.btn_urp_next.clicked.connect(lambda: self._urp_send("next"))
+        self.btn_urp_status.clicked.connect(lambda: self._urp_send("status"))
+        self.btn_urp_rec_start.clicked.connect(lambda: self._urp_send("record_start"))
+        self.btn_urp_rec_stop.clicked.connect(lambda: self._urp_send("record_stop"))
+        self._urp_result.connect(self._on_urp_result)
+        self.urp_host.editingFinished.connect(self._save_urp_settings)
+        self.urp_port.valueChanged.connect(self._save_urp_settings)
 
         # UI update timer
         self.timer = QTimer(self); self.timer.timeout.connect(self.repaint_canvas); self.timer.start(5)
@@ -460,9 +555,13 @@ class MainWindow(QMainWindow):
         # shortcut
         self.setFocusPolicy(Qt.StrongFocus)
 
-        self.shortcut_space = QShortcut(QKeySequence(Qt.Key_Space), self)
-        self.shortcut_space.setContext(Qt.ApplicationShortcut)
-        self.shortcut_space.activated.connect(self.trigger_step)
+        # Next calib dot: G / H / I / J (Space removed — easier while standing / walking pad)
+        self._shortcut_next_step = []
+        for key in (Qt.Key_G, Qt.Key_H, Qt.Key_I, Qt.Key_J):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(self.trigger_step)
+            self._shortcut_next_step.append(sc)
 
         self.shortcut_s = QShortcut(QKeySequence(Qt.Key_S), self)
         self.shortcut_s.setContext(Qt.ApplicationShortcut)
@@ -562,7 +661,44 @@ class MainWindow(QMainWindow):
         if self.session.gaze != GazeMode.OFF:
             self._set_gaze_mode(GazeMode.OFF)
 
+    def on_show_ray_toggled(self, checked: bool):
+        self._push_show_ray()
+
+    def _push_show_ray(self):
+        if not (self.tcp_thread and self.tcp_thread.conn):
+            return
+        try:
+            visible = bool(self.chk_show_ray.isChecked())
+            self.tcp_thread.send_show_ray(visible)
+        except Exception as e:
+            print(f"[showRay] send failed: {e}")
+
+    def _set_handoff_ui_visible(self, visible: bool):
+        """Show/hide launchApp transfer buttons (off by default for pilot reliability)."""
+        for btn in getattr(self, "_handoff_buttons", ()):
+            btn.setVisible(bool(visible))
+
     def go_to(self, target_package: str, *, title: str, detail: str) -> bool:
+        """
+        Debug-only APK handoff via launchApp.
+
+        Critical path no longer uses this. When reimplemented, keep a thin contract:
+          1) PC sends launchApp + expected package
+          2) Target app sends sessionHello once on TCP connect
+          3) PC resumes gaze only if hello.package matches expected
+          4) Hard timeout + clear error (no silent fallback guessing)
+        Do not expand sticky-session / fallback-hello until that contract is solid.
+        """
+        if not getattr(self, "chk_debug_handoff", None) or not self.chk_debug_handoff.isChecked():
+            QMessageBox.information(
+                self,
+                title,
+                "APK handoff is disabled.\n\n"
+                "Open the target app manually on the Quest, then Connect TCP / Gaze on PC.\n"
+                "Enable “Debug: show APK handoff buttons” only if you need launchApp.",
+            )
+            return False
+
         ok, reason = self.session.can_handoff_to(target_package)
         if not ok:
             QMessageBox.information(self, title, reason)
@@ -581,13 +717,6 @@ class MainWindow(QMainWindow):
         # Sticky intent — survives brief TCP gap / reconnect after launchApp.
         self._want_study_gaze = target_package in (PKG_PRACTICE, PKG_MAIN_STUDY)
         self._set_gaze_mode(GazeMode.OFF, quiet=True)
-        mon = self._time_echo_monitor
-        if mon is not None and mon.is_alive():
-            mon.stop()
-            mon.join(timeout=2.0)
-            self._time_echo_monitor = None
-            self.btn_time_echo.setText("Start Quest↔PC time-echo")
-            self.status_sync("idle")
         time.sleep(0.15)
 
         self.tcp_thread.send_launch_app(target_package)
@@ -611,6 +740,9 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(400, self._fallback_hello_from_pending)
             for delay_ms in (200, 800, 2000):
                 QTimer.singleShot(delay_ms, self._auto_resume_study_gaze)
+            # Push current ray visibility after Quest reconnects.
+            QTimer.singleShot(300, self._push_show_ray)
+            QTimer.singleShot(500, self._maybe_auto_start_hub_sync)
         elif "disconnect" in low or low.startswith("recv error") or low.startswith("quest disconnect"):
             # Pause TX into dead socket, but KEEP _want_study_gaze.
             # Old bug: after fallback cleared handoff_pending, disconnect permanently
@@ -717,6 +849,7 @@ class MainWindow(QMainWindow):
             self.gaze_thread = GazeCollector(self.device, self.state, filter=filter)
             self.gaze_thread.on_new_filtered = self.stream_gaze_visual
             self.gaze_thread.start()
+            QTimer.singleShot(500, self._maybe_auto_start_hub_sync)
 
         except Exception as e:
             self.neon_status.setText(f"Neon Error: {e}")
@@ -741,12 +874,11 @@ class MainWindow(QMainWindow):
         self.state.ended = False
         self.state.recording = True
         self.session.on_calib_started()
-        self.step_label.setText("Step: 1 / 25 — fixate, then Next")
         self.btn_start_calib.setEnabled(False)
-        self.btn_next_step.setEnabled(True)
         if self.tcp_thread and self.tcp_thread.conn:
             self.tcp_thread.send_reset_calib()
             self.tcp_thread.send_step(0)
+        self._arm_calib_dwell()
 
     def on_reset_calibration(self):
         with self.state.lock:
@@ -758,6 +890,7 @@ class MainWindow(QMainWindow):
         self.step_label.setText("Step: idle")
         self.btn_start_calib.setEnabled(True)
         self.btn_next_step.setEnabled(False)
+        self._calib_dwell_timer.stop()
         if self.tracking_active:
             self.on_toggle_gaze_tracking()
         if self.eval_active:
@@ -784,8 +917,58 @@ class MainWindow(QMainWindow):
         self.tcp_thread = TcpServer(self.status_tcp, message_cb=self.on_tcp_message)
         self.tcp_thread.start()
 
-    def _neon_time_offset_estimate(self) -> Optional[Dict]:
-        """Pupil Time Echo: phone→PC offset (same formula as Quest leg)."""
+    def _ensure_echo_loggers(self):
+        self.ensure_dirs()
+        if self._quest_echo_logger is None:
+            path = os.path.join(self.participant_dir, "sync_quest_echo.jsonl")
+            self._quest_echo_logger = JsonLogger(path)
+            self._quest_echo_logger.start()
+        if self._neon_echo_logger is None:
+            path = os.path.join(self.participant_dir, "sync_neon_echo.jsonl")
+            self._neon_echo_logger = JsonLogger(path)
+            self._neon_echo_logger.start()
+
+    def _log_quest_echo(self, sample: dict):
+        self._ensure_echo_loggers()
+        self._quest_echo_logger.log({"type": "questEcho", **sample})
+
+    def _log_neon_echo(self, sample: dict):
+        self._ensure_echo_loggers()
+        self._neon_echo_logger.log({"type": "neonEcho", **sample})
+
+    def _neon_time_echo_from_est(self, est, *, n: int) -> Optional[Dict]:
+        if est is None:
+            return None
+        offset_ms = float(est.time_offset_ms.mean)
+        return {
+            "offset_ms": offset_ms,
+            "offset_phone_to_pc_ns": int(round(offset_ms * 1_000_000)),
+            "phone_offset_ms_mean": offset_ms,
+            "phone_offset_ms_std": float(est.time_offset_ms.std),
+            "phone_rtt_ms_mean": float(est.roundtrip_duration_ms.mean),
+            "phone_rtt_ms_std": float(est.roundtrip_duration_ms.std),
+            "measurements": int(n),
+        }
+
+    def _neon_time_echo_sample(self) -> Optional[Dict]:
+        """Periodic Pupil time-echo (≥2 samples — Pupil Estimate needs stdev)."""
+        if not self.device:
+            return None
+        try:
+            # n=1 → Pupil logger.exception(StatisticsError) spam; use 2+.
+            est = self.device.estimate_time_offset(
+                number_of_measurements=2,
+                sleep_between_measurements_seconds=None,
+            )
+        except Exception as e:
+            print(f"[pcHubSync] neon echo error: {e}")
+            return None
+        if est is None:
+            return None
+        return self._neon_time_echo_from_est(est, n=2)
+
+    def _neon_time_echo_burst(self) -> Optional[Dict]:
+        """Initial Neon lock (faster than Quest burst)."""
         if not self.device:
             return None
         try:
@@ -794,16 +977,62 @@ class MainWindow(QMainWindow):
                 sleep_between_measurements_seconds=None,
             )
         except Exception as e:
-            print(f"[timeEcho] neon estimate error: {e}")
+            print(f"[pcHubSync] neon burst error: {e}")
             return None
-        if est is None:
-            return None
-        return {
-            "offset_phone_to_pc_ns": int(round(est.time_offset_ms.mean * 1_000_000)),
-            "phone_offset_ms_mean": float(est.time_offset_ms.mean),
-            "phone_offset_ms_std": float(est.time_offset_ms.std),
-            "phone_rtt_ms_mean": float(est.roundtrip_duration_ms.mean),
-        }
+        return self._neon_time_echo_from_est(est, n=20)
+
+    def _hub_sync_ready(self) -> bool:
+        return bool(self.device and self.tcp_thread and self.tcp_thread.conn)
+
+    def _start_hub_sync(self, *, auto: bool = False) -> bool:
+        if self._time_echo_monitor is not None:
+            try:
+                if self._time_echo_monitor.is_alive():
+                    return True
+            except TypeError:
+                pass
+            self._time_echo_monitor = None
+
+        if not self._hub_sync_ready():
+            if not auto:
+                QMessageBox.information(
+                    self,
+                    "PC hub sync",
+                    "Connect Neon and Quest (TCP) first.",
+                )
+            return False
+
+        self.ensure_dirs()
+        period_s = float(self.sync_period_spin.value())
+        self._time_echo_monitor = PcHubSyncMonitor(
+            self.tcp_thread,
+            participant_dir_fn=lambda: self.participant_dir,
+            period_s=period_s,
+            burst_n=100,
+            rolling_n=100,
+            echo_timeout_s=1.0,
+            neon_sample_fn=self._neon_time_echo_sample,
+            neon_burst_fn=self._neon_time_echo_burst,
+            quest_echo_cb=self._log_quest_echo,
+            neon_echo_cb=self._log_neon_echo,
+            status_cb=self.status_sync,
+        )
+        self._time_echo_monitor.start()
+        self.btn_time_echo.setText("Stop PC hub sync")
+        tag = "auto-started" if auto else "started"
+        self.status_sync(f"{tag} (Quest+Neon every {period_s:.0f}s)")
+        return True
+
+    def _maybe_auto_start_hub_sync(self):
+        if self._hub_sync_user_stopped:
+            return
+        if self._time_echo_monitor is not None:
+            try:
+                if self._time_echo_monitor.is_alive():
+                    return
+            except TypeError:
+                pass
+        self._start_hub_sync(auto=True)
 
     def on_toggle_time_echo(self):
         mon = self._time_echo_monitor
@@ -811,40 +1040,20 @@ class MainWindow(QMainWindow):
             try:
                 alive = mon.is_alive()
             except TypeError:
-                # Old bug: monitor named Event `_stop` and broke Thread.is_alive().
                 alive = False
             if alive:
                 mon.stop()
                 mon.join(timeout=2.0)
                 self._time_echo_monitor = None
-                self.btn_time_echo.setText("Start Quest↔PC time-echo")
+                self._hub_sync_user_stopped = True
+                self.btn_time_echo.setText("Start PC hub sync")
                 self.status_sync("stopped")
                 return
             self._time_echo_monitor = None
 
-        if not (self.tcp_thread and self.tcp_thread.conn):
-            QMessageBox.information(
-                self,
-                "Time echo",
-                "Start TCP and connect MainStudy on Quest first.",
-            )
+        self._hub_sync_user_stopped = False
+        if self._start_hub_sync(auto=False):
             return
-
-        self.ensure_dirs()
-        period_s = float(self.sync_period_spin.value())
-        self._time_echo_monitor = QuestTimeEchoMonitor(
-            self.tcp_thread,
-            participant_dir_fn=lambda: self.participant_dir,
-            period_s=period_s,
-            burst_n=100,
-            rolling_n=100,
-            neon_estimate_fn=self._neon_time_offset_estimate,
-            neon_every_n_periods=max(5, int(10 / max(period_s, 0.5))),
-            status_cb=self.status_sync,
-        )
-        self._time_echo_monitor.start()
-        self.btn_time_echo.setText("Stop Quest↔PC time-echo")
-        self.status_sync(f"running (period={period_s:.0f}s)")
 
     def on_tcp_message(self, msg: dict):
         # Runs on the TCP thread; marshal to GUI thread via signals.
@@ -901,101 +1110,32 @@ class MainWindow(QMainWindow):
         self._refresh_session_ui()
 
     def _on_main_study_done(self, payload: dict):
-        self._ms_running = False
-        self.session.on_main_study_done()
         cond = payload.get("condition", "?")
         ok = payload.get("ok", True)
         sub = payload.get("sub_num", "?")
         subsub = payload.get("subsub_num", "?")
         reps = payload.get("reps", "?")
-        state = "done" if ok else "failed"
+        if payload.get("stopped"):
+            reason = "stopped"
+        else:
+            reason = "done" if ok else "failed"
+        self._reset_main_study_pc_idle(reason=reason)
         self.ms_status.setText(
-            f"Status: {state} — sub {sub}-{subsub} {cond} ×{reps}; IDLE again"
+            f"Status: {reason} — sub {sub}-{subsub} {cond} ×{reps}; IDLE again"
         )
-        self.btn_ms_start.setEnabled(True)
         print(f"[mainStudyDone] {payload}")
         self._want_study_gaze = True
         self._auto_resume_study_gaze()
         self._refresh_session_ui()
 
     def _on_sync_pulse_record(self, record: dict):
-        # Prefer Companion HTTP /api/event so we do NOT call device.send_event
-        # (asyncio.run) while GazeCollector is using the same Device — that race
-        # can stall gaze streaming and corrupt later calibrations.
-        if self.device:
-            try:
-                neon_ns = self._neon_companion_send_event(
-                    "quest_sync", int(record["pc_recv_unix_ns"])
-                )
-                record["neon_event_name"] = "quest_sync"
-                record["neon_event_ns"] = int(neon_ns)
-                record["neon_event_ok"] = True
-            except Exception as e:
-                record["neon_event_ok"] = False
-                record["neon_event_error"] = str(e)
-                print(f"[syncPulse] companion event failed: {e}")
-        else:
-            record["neon_event_ok"] = False
-            record["neon_event_error"] = "neon_not_connected"
-            print("[syncPulse] Neon not connected; skipped send_event")
-
+        # Legacy Quest→Neon one-way pulses: log only. PC hub sync.json comes from
+        # PcHubSyncMonitor (Quest↔PC + Neon↔PC time-echo), not quest_sync events.
         self._ensure_sync_pulse_logger()
         self._sync_pulse_logger.log(record)
         print(
             f"[syncPulse] seq={record['seq']} quest_ms={record['quest_sent_unix_ms']} "
-            f"pc_ms={record['pc_recv_unix_ms']} neon_ns={record.get('neon_event_ns')}"
-        )
-
-        if record.get("neon_event_ok"):
-            self._sync_pulse_batch.append(record)
-            if record.get("seq") == 2:
-                self._finalize_sync_json()
-
-    def _neon_companion_send_event(self, name: str, timestamp_ns: int) -> int:
-        """POST /api/event on Neon Companion (phone). Avoids Device.send_event races."""
-        phone_ip = getattr(self.device, "phone_ip", None)
-        if not phone_ip:
-            raise RuntimeError("device.phone_ip unavailable")
-        url = f"http://{phone_ip}:8080/api/event"
-        body = json.dumps(
-            {"name": str(name), "timestamp": int(timestamp_ns)},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace") if e.fp else ""
-            raise RuntimeError(f"HTTP {e.code}: {detail or e.reason}") from e
-        if raw.strip():
-            try:
-                payload = json.loads(raw)
-                if isinstance(payload, dict) and payload.get("timestamp") is not None:
-                    return int(payload["timestamp"])
-            except Exception:
-                pass
-        return int(timestamp_ns)
-
-    def _finalize_sync_json(self):
-        payload = compute_sync_from_pulses(self._sync_pulse_batch)
-        self._sync_pulse_batch.clear()
-        if payload is None:
-            print("[syncPulse] no valid neon pairs; sync.json not written")
-            return
-        self.ensure_dirs()
-        self.sync_json_path = os.path.join(self.participant_dir, "sync.json")
-        write_sync_json(self.sync_json_path, payload)
-        print(
-            f"[syncPulse] sync.json offset_quest_to_phone_ns="
-            f"{payload['offset_quest_to_phone_ns']} "
-            f"spread_std_ns={payload['offset_spread_std_ns']} "
-            f"pulses={payload['pulse_count']}"
+            f"pc_ms={record['pc_recv_unix_ms']} (logged only; use PC hub sync)"
         )
 
     # ---- Evaluation ----
@@ -1136,11 +1276,36 @@ class MainWindow(QMainWindow):
         self._ms_running = True
         self.session.on_main_study_started()
         self.btn_ms_start.setEnabled(False)
+        self.btn_ms_stop.setEnabled(True)
         self.ms_status.setText(
             f"Status: running {condition} ×{reps} ({duration_sec // 60} min each) "
             f"for {sub_num}-{subsub_num}…"
         )
         self._refresh_session_ui()
+
+    def on_main_study_stop(self):
+        """Abort current Main Study condition: reset PC to IDLE and tell Quest to stop."""
+        if self.tcp_thread and self.tcp_thread.conn:
+            try:
+                self.tcp_thread.send_main_study_stop()
+            except Exception as e:
+                print(f"[mainStudyStop] send failed: {e}")
+        else:
+            print("[mainStudyStop] no TCP — resetting PC state only")
+
+        self._reset_main_study_pc_idle(reason="stopped")
+
+    def _reset_main_study_pc_idle(self, *, reason: str = "idle"):
+        self._ms_running = False
+        self.session.on_main_study_done()
+        self.btn_ms_start.setEnabled(True)
+        self.btn_ms_stop.setEnabled(True)
+        self.ms_status.setText(
+            f"Status: {reason} — IDLE (ready for next Start condition)"
+        )
+        print(f"[mainStudy] PC → IDLE ({reason})")
+        self._refresh_session_ui()
+
     def load_models(self, quiet: bool = False):
         self.ensure_dirs()
         model_dir = os.path.join(self.participant_dir, "models")
@@ -1246,11 +1411,42 @@ class MainWindow(QMainWindow):
         return False
 
     # ---- Step / End ----
+    def _calib_min_dwell_s(self) -> float:
+        return float(CFG.mapping.min_step_dwell_s)
+
+    def _arm_calib_dwell(self):
+        """Require min dwell on the current dot before Next is allowed."""
+        dwell = self._calib_min_dwell_s()
+        self._calib_dot_shown_at = time.perf_counter()
+        self.btn_next_step.setEnabled(False)
+        self.step_label.setText(
+            f"Step: {self.state.step + 1} / 25 — fixate ≥{dwell:.0f}s, then Next"
+        )
+        self._calib_dwell_timer.stop()
+        self._calib_dwell_timer.start(int(max(0.05, dwell) * 1000))
+
+    def _on_calib_dwell_ready(self):
+        if not self.state.recording or self.state.ended:
+            return
+        self.btn_next_step.setEnabled(True)
+        self.step_label.setText(
+            f"Step: {self.state.step + 1} / 25 — fixate, then Next (G/H/I/J)"
+        )
+
     def trigger_step(self):
         if self.state.ended:
             return
         if not self.state.recording:
             QMessageBox.information(self, "Info", "Press 'S' to start recording first.")
+            return
+
+        dwell = self._calib_min_dwell_s()
+        elapsed = time.perf_counter() - self._calib_dot_shown_at
+        if elapsed < dwell:
+            remain = dwell - elapsed
+            self.step_label.setText(
+                f"Step: {self.state.step + 1} / 25 — wait {remain:.1f}s more before Next"
+            )
             return
 
         prev_events = self._gaze_event_count()
@@ -1261,8 +1457,9 @@ class MainWindow(QMainWindow):
             self.state.step += 1
             if self.tcp_thread and self.tcp_thread.conn:
                 self.tcp_thread.send_step(self.state.step)
-            self.step_label.setText(f"Step: {self.state.step + 1} / 25 — fixate, then Next")
+            self._arm_calib_dwell()
         else:
+            self._calib_dwell_timer.stop()
             if not self._wait_for_gaze_event(prev_events):
                 print("[CALIB] timed out waiting for final gaze event")
             if self.tcp_thread and self.tcp_thread.conn:
@@ -1368,6 +1565,47 @@ class MainWindow(QMainWindow):
         save_models(model_path, biquad_model, ridge_model)
         
         return model_path
+
+    # ---- URP2026 recorder (phone PC-bridge :8765) ----
+    def _save_urp_settings(self):
+        self._settings.setValue("urp2026/host", self.urp_host.text().strip())
+        self._settings.setValue("urp2026/port", int(self.urp_port.value()))
+
+    def _set_urp_buttons_enabled(self, enabled: bool):
+        for b in self._urp_buttons:
+            b.setEnabled(enabled)
+
+    def _urp_send(self, command: str):
+        host = self.urp_host.text().strip()
+        if not host:
+            QMessageBox.information(
+                self, "URP2026",
+                "Enter the phone IP first (URP2026 → Start PC bridge (:8765)).",
+            )
+            return
+        port = int(self.urp_port.value())
+        timeout = float(CFG.urp2026.timeout_s)
+        self._save_urp_settings()
+        self._set_urp_buttons_enabled(False)
+        self.urp_status.setText(f"URP2026 [{command}] …")
+
+        def worker():
+            try:
+                code, body = urp_send_command(host, command, port=port, timeout=timeout)
+                self._urp_result.emit(command, int(code), body, code < 400)
+            except Urp2026Error as e:
+                self._urp_result.emit(command, 0, str(e), False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_urp_result(self, command: str, code: int, body: str, ok: bool):
+        self._set_urp_buttons_enabled(True)
+        head = "OK" if ok else "ERR"
+        code_txt = f" HTTP {code}" if code else ""
+        lines = [ln for ln in (body or "").splitlines() if ln.strip()]
+        first = lines[0] if lines else ""
+        self.urp_status.setText(f"URP2026 [{command}] {head}{code_txt}: {first}")
+        print(f"[urp2026] {command} ok={ok} code={code}\n{body}")
 
     # ---- Cleanup ----
     def cleanup_and_close(self):
